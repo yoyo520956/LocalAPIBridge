@@ -414,6 +414,8 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
+当前这次构建已在 GitHub Actions 的 macOS runner 上成功完成，产出的 IPA 内含 arm64 Mach-O、`UIBackgroundModes=audio`、Bundle ID `com.yoyo520956.localapibridge`，并通过了 Release 下载校验。
+
 ### 12.1 下载
 
 Release 页面：<https://github.com/yoyo520956/LocalAPIBridge/releases/tag/v1.0.0>
@@ -430,6 +432,12 @@ https://github.com/yoyo520956/LocalAPIBridge/releases/download/v1.0.0/LocalAPIBr
 https://ghproxy.net/https://github.com/yoyo520956/LocalAPIBridge/releases/download/v1.0.0/LocalAPIBridge-unsigned.ipa
 https://gh-proxy.com/https://github.com/yoyo520956/LocalAPIBridge/releases/download/v1.0.0/LocalAPIBridge-unsigned.ipa
 https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/download/v1.0.0/LocalAPIBridge-unsigned.ipa
+```
+
+SHA256：
+
+```
+26d12bab3db09fc14dfc91cdf967411da712b9d8baaebc4f36a7b1842935afa5
 ```
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
