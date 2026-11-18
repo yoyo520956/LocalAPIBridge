@@ -30,12 +30,15 @@ struct ContentView: View {
         .overlay(alignment: .topLeading) {
             PiPAnchorView()
                 .frame(width: 44, height: 28)
-                .opacity(0.01)
+                .opacity(0.05)
                 .allowsHitTesting(false)
         }
         .onAppear {
             keeper.setScreenAlwaysOn(screenAlwaysOn)
             pip.setEnabled(pipKeepAlive)
+            if pipKeepAlive, !pip.isEnabled {
+                pipKeepAlive = false
+            }
             engine.bootstrap()
             if keepAlive, !keeper.start() {
                 keepAlive = false
@@ -45,7 +48,7 @@ struct ContentView: View {
             pip.setEnabled(newValue)
         }
         .onChange(of: scenePhase) { newPhase in
-            if newPhase == .background {
+            if newPhase == .inactive || newPhase == .background {
                 pip.startIfPossible()
             }
             if newPhase == .active {

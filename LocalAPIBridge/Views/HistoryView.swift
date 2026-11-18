@@ -92,6 +92,12 @@ struct RecordDetailView: View {
                 if !record.sourceURL.isEmpty {
                     infoRow("上游地址", record.sourceURL)
                 }
+                if let model = record.modelName, !model.isEmpty {
+                    infoRow("模型", model)
+                }
+                if let tokens = record.tokensUsed {
+                    infoRow("Token 用量", "\(tokens)")
+                }
                 if !record.contentType.isEmpty {
                     infoRow("Content-Type", record.contentType)
                 }

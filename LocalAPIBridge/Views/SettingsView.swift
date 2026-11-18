@@ -243,8 +243,12 @@ struct SettingsView: View {
     private var pipSection: some View {
         Section {
             Toggle("画中画保活（显示运行信息）", isOn: $pipKeepAlive)
+                .disabled(!pip.isSupported)
                 .onChange(of: pipKeepAlive) { newValue in
                     pip.setEnabled(newValue)
+                    if newValue, !pip.isEnabled {
+                        pipKeepAlive = false
+                    }
                 }
 
             TextField("显示模型名称（留空则自动识别）", text: $draft.displayModelName)
@@ -263,7 +267,7 @@ struct SettingsView: View {
             HStack {
                 Text("画中画状态")
                 Spacer()
-                Text(pip.isActive ? "运行中" : (pip.isEnabled ? "已开启" : "未开启"))
+                Text(pip.isActive ? "运行中" : (pip.isEnabled ? (pip.isPossible ? "已就绪" : "等待就绪") : (pip.isSupported ? "未开启" : "不支持")))
                     .foregroundStyle(pip.isActive ? Color.green : Color.secondary)
             }
 
@@ -282,7 +286,7 @@ struct SettingsView: View {
         } header: {
             Text("画中画浮窗")
         } footer: {
-            Text("iOS 16+。开启后切到后台会自动出现画中画，浮窗显示模型、上下文使用、时间、系统运行秒数；画中画期间 App 保持运行。模型和 token 会尽量从上游 JSON 的 model / usage.total_tokens 等字段自动读取，读不到时用上面的模型名称和上限显示。")
+            Text("iOS 16+。开启后切到其它 App 或回到桌面会自动出现画中画；锁屏时系统通常不显示浮窗，但音频会话仍会尽量维持后台运行。浮窗显示模型、上下文使用、时间、系统运行秒数。模型和 token 会尽量从上游 JSON 的 model / usage.total_tokens 等字段自动读取，读不到时用上面的模型名称和上限显示。")
         }
     }
 

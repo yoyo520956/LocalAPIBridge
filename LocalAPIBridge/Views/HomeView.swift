@@ -198,7 +198,7 @@ struct HomeView: View {
                     .foregroundStyle(pipColor)
             }
 
-            Text("锁屏或切到后台后，系统画中画会持续显示当前模型、上下文使用、时间和系统运行秒数，同时保持轮询与本地服务。")
+            Text("切到其它 App 或回到桌面后，系统画中画会持续显示当前模型、上下文使用、时间和系统运行秒数，同时保持轮询与本地服务。锁屏时系统通常不显示浮窗。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -230,7 +230,7 @@ struct HomeView: View {
             return "画中画运行中"
         }
         if pip.isEnabled {
-            return "已开启"
+            return pip.isPossible ? "已就绪" : "等待就绪"
         }
         return "未开启"
     }
