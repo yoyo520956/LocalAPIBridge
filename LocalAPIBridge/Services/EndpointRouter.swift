@@ -40,10 +40,37 @@ private enum ProbeOutcome: Sendable {
     case failure(String)
 }
 
+/// 流式代理向本地 HTTP 服务吐出的增量事件。
+enum StreamEvent: Sendable {
+    case head(contentType: String)
+    case chunk(Data)
+    case finished
+    case failed(message: String, status: Int)
+}
+
 private enum ProxyAttempt: Sendable {
     case success(AIProxyReply, AIEndpoint, Int)
     case failure(AIEndpoint, String, Int, Int)
     case cancelled
+}
+
+private enum StreamOutcome: Sendable {
+    case won(AIEndpoint, Int)
+    case lost
+    case failed(AIEndpoint, String, Int, Int)
+}
+
+/// 保证同一时刻只有一个上游流在往客户端写。
+private actor StreamRace {
+    private var claimed = false
+
+    var isClaimed: Bool { claimed }
+
+    func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
+    }
 }
 
 /// 多端点 AI 路由：
@@ -67,6 +94,7 @@ final class EndpointRouter: ObservableObject {
     @Published private(set) var failureCount = 0
 
     private let session: URLSession
+    private let streamingSession: URLSession
     private var monitorTask: Task<Void, Never>?
     private var monitorGeneration = 0
     private var didBootstrap = false
@@ -80,6 +108,15 @@ final class EndpointRouter: ObservableObject {
         sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
         sessionConfiguration.httpAdditionalHeaders = ["User-Agent": "LocalAPIBridge-Router/1.0 (iOS)"]
         session = URLSession(configuration: sessionConfiguration)
+
+        // 流式请求单独一套会话：模型可能连续输出几分钟，
+        // 不能被 90 秒的资源超时打断。
+        let streamingConfiguration = URLSessionConfiguration.ephemeral
+        streamingConfiguration.timeoutIntervalForRequest = 60
+        streamingConfiguration.timeoutIntervalForResource = 900
+        streamingConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        streamingConfiguration.httpAdditionalHeaders = ["User-Agent": "LocalAPIBridge-Router/1.0 (iOS)"]
+        streamingSession = URLSession(configuration: streamingConfiguration)
         reconcileHealth()
     }
 
@@ -221,8 +258,11 @@ final class EndpointRouter: ObservableObject {
         for raw in models {
             let model = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !model.isEmpty else { continue }
+            // 同一个 base + 模型 + key 才视为重复；不同 key 允许并存，
+            // 这样“多把免费 key 轮着用”可以直接全选导入。
+            let apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             let exists = configuration.endpoints.contains {
-                $0.trimmedBaseURL == base && $0.model == model
+                $0.trimmedBaseURL == base && $0.model == model && $0.apiKey == apiKey
             }
             guard !exists else { continue }
             var endpoint = AIEndpoint()
@@ -524,6 +564,238 @@ final class EndpointRouter: ObservableObject {
             }
         }
         return .error(lastMessage)
+    }
+
+    // MARK: - 流式代理（SSE 透传 + 首字节竞速）
+
+    /// 客户端要 stream=true 时走这里：边收边发，谁先吐出第一行就锁谁。
+    func streamChat(body: Data, incomingHeaders: [String: String]) -> AsyncStream<StreamEvent> {
+        let candidates = Array(rankedEndpoints().prefix(max(configuration.maxRaceEndpoints, 1)))
+        let hedgeMilliseconds = configuration.hedgeDelayMilliseconds
+        let streamSession = streamingSession
+        return AsyncStream { continuation in
+            let task = Task { @MainActor in
+                await self.runStreamRace(
+                    candidates: candidates,
+                    body: body,
+                    incomingHeaders: incomingHeaders,
+                    hedgeMilliseconds: hedgeMilliseconds,
+                    session: streamSession,
+                    continuation: continuation
+                )
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
+    private func runStreamRace(
+        candidates: [AIEndpoint],
+        body: Data,
+        incomingHeaders: [String: String],
+        hedgeMilliseconds: Int,
+        session: URLSession,
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async {
+        guard !candidates.isEmpty else {
+            continuation.yield(.failed(message: "没有启用的 AI 端点", status: 503))
+            continuation.finish()
+            return
+        }
+
+        let race = StreamRace()
+        var winner: AIEndpoint?
+        var winnerLatency = 0
+        var failures: [(AIEndpoint, String, Int, Int)] = []
+
+        await withTaskGroup(of: StreamOutcome.self) { group in
+            for (index, endpoint) in candidates.enumerated() {
+                group.addTask {
+                    if index > 0, hedgeMilliseconds > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(hedgeMilliseconds * index) * 1_000_000)
+                    }
+                    if Task.isCancelled { return .lost }
+                    if await race.isClaimed { return .lost }
+                    return await Self.streamAttempt(
+                        endpoint: endpoint,
+                        body: body,
+                        incomingHeaders: incomingHeaders,
+                        session: session,
+                        race: race,
+                        continuation: continuation
+                    )
+                }
+            }
+            for await outcome in group {
+                switch outcome {
+                case .won(let endpoint, let latency):
+                    winner = endpoint
+                    winnerLatency = latency
+                    group.cancelAll()
+                case .failed(let endpoint, let message, let latency, let statusCode):
+                    failures.append((endpoint, message, latency, statusCode))
+                case .lost:
+                    break
+                }
+                if winner != nil { break }
+            }
+        }
+
+        if let winner {
+            recordStreamSuccess(endpoint: winner, latency: max(winnerLatency, 0))
+            continuation.yield(.finished)
+        } else {
+            for failure in failures {
+                recordFailure(
+                    endpoint: failure.0,
+                    message: failure.1,
+                    latency: failure.2,
+                    statusCode: failure.3
+                )
+            }
+            let message = failures.last.map { "\($0.0.displayName)：\($0.1)" } ?? "所有端点均失败"
+            let status = failures.last.map { $0.3 } ?? 0
+            continuation.yield(.failed(message: message, status: status > 0 ? status : 503))
+        }
+        continuation.finish()
+    }
+
+    private nonisolated static func streamAttempt(
+        endpoint: AIEndpoint,
+        body: Data,
+        incomingHeaders: [String: String],
+        session: URLSession,
+        race: StreamRace,
+        continuation: AsyncStream<StreamEvent>.Continuation
+    ) async -> StreamOutcome {
+        guard let url = endpoint.chatURL else {
+            return .failed(endpoint, "chat URL 无效", 0, 0)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 180
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        Self.applyAuth(to: &request, endpoint: endpoint, incomingHeaders: incomingHeaders)
+        for header in endpoint.extraHeaders {
+            let key = header.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            request.setValue(header.value, forHTTPHeaderField: key)
+        }
+        request.httpBody = Self.rewriteBody(body, model: endpoint.model, stream: true)
+
+        let startedAt = Date()
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failed(endpoint, "非 HTTP 响应", 0, 0)
+            }
+            let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "text/event-stream; charset=utf-8"
+            guard (200..<300).contains(http.statusCode) else {
+                var preview = ""
+                do {
+                    for try await line in bytes.lines {
+                        preview += line
+                        if preview.count > 400 { break }
+                    }
+                } catch {
+                    // 读不到错误体也不影响判定
+                }
+                let latency = Int(Date().timeIntervalSince(startedAt) * 1000)
+                return .failed(endpoint, "HTTP \(http.statusCode) \(preview)", latency, http.statusCode)
+            }
+
+            let isEventStream = contentType.lowercased().contains("event-stream")
+
+            // 有些中转站忽略 stream=true，直接回一整段 JSON：包装成一条 SSE 事件，
+            // 免得客户端（Cherry Studio / Chatbox / OpenAI SDK）解析失败。
+            if !isEventStream {
+                var buffer = ""
+                for try await line in bytes.lines {
+                    buffer += line
+                    buffer += "\n"
+                }
+                if Task.isCancelled { return .lost }
+                if await race.isClaimed { return .lost }
+                let didClaim = await race.claim()
+                guard didClaim else { return .lost }
+                let latency = Int(Date().timeIntervalSince(startedAt) * 1000)
+                let compact = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                continuation.yield(.head(contentType: "text/event-stream; charset=utf-8"))
+                continuation.yield(.chunk(Data("data: \(compact)\n\n".utf8)))
+                continuation.yield(.chunk(Data("data: [DONE]\n\n".utf8)))
+                return .won(endpoint, latency)
+            }
+
+            var claimed = false
+            var firstByteMilliseconds = 0
+            var sawDone = false
+            for try await line in bytes.lines {
+                if Task.isCancelled { return .lost }
+                if !claimed {
+                    if await race.isClaimed { return .lost }
+                    let didClaim = await race.claim()
+                    guard didClaim else { return .lost }
+                    claimed = true
+                    firstByteMilliseconds = Int(Date().timeIntervalSince(startedAt) * 1000)
+                    continuation.yield(.head(contentType: contentType))
+                }
+                if line.contains("[DONE]") {
+                    sawDone = true
+                }
+                continuation.yield(.chunk(Data((line + "\n").utf8)))
+            }
+
+            guard claimed else {
+                let latency = Int(Date().timeIntervalSince(startedAt) * 1000)
+                return .failed(endpoint, "上游没有返回流式数据", latency, 0)
+            }
+            if !sawDone {
+                continuation.yield(.chunk(Data("data: [DONE]\n\n".utf8)))
+            }
+            return .won(endpoint, firstByteMilliseconds)
+        } catch {
+            if Task.isCancelled || (error as NSError).code == NSURLErrorCancelled {
+                return .lost
+            }
+            let latency = Int(Date().timeIntervalSince(startedAt) * 1000)
+            return .failed(endpoint, error.localizedDescription, latency, 0)
+        }
+    }
+
+    private func recordStreamSuccess(endpoint: AIEndpoint, latency: Int) {
+        var item = health[endpoint.id] ?? .unknown(endpoint.id)
+        item.state = .healthy
+        if let previous = item.latencyMilliseconds {
+            item.latencyMilliseconds = Int(Double(previous) * 0.7 + Double(latency) * 0.3)
+        } else {
+            item.latencyMilliseconds = latency
+        }
+        item.successCount += 1
+        item.consecutiveFailures = 0
+        item.lastChecked = Date()
+        item.lastSuccess = Date()
+        item.lastError = nil
+        item.cooldownUntil = nil
+        health[endpoint.id] = item
+
+        lastSelectedEndpoint = endpoint
+        lastCompletionModel = endpoint.displayModel
+        requestCount += 1
+        successCount += 1
+        lastError = nil
+        appendLog(
+            RouteLog(
+                endpointID: endpoint.id,
+                endpointName: endpoint.displayName,
+                model: endpoint.displayModel,
+                success: true,
+                statusCode: 200,
+                latencyMilliseconds: latency,
+                errorMessage: nil
+            )
+        )
     }
 
     private func recordSuccess(endpoint: AIEndpoint, reply: AIProxyReply, latency: Int) {
@@ -1005,7 +1277,7 @@ final class EndpointRouter: ObservableObject {
         }
     }
 
-    private nonisolated static func rewriteBody(_ body: Data, model: String) -> Data {
+    private nonisolated static func rewriteBody(_ body: Data, model: String, stream: Bool = false) -> Data {
         guard !body.isEmpty else { return body }
         guard let raw = try? JSONSerialization.jsonObject(with: body),
               var object = raw as? [String: Any] else {
@@ -1019,8 +1291,8 @@ final class EndpointRouter: ObservableObject {
             // 客户端选了“自动”但这个端点没固定模型：交给上游默认模型。
             object.removeValue(forKey: "model")
         }
-        // 本地代理先统一走非流式，拿到完整 JSON 后一次性返回。
-        object["stream"] = false
+        // 非流式请求保持一次性返回；流式请求交给 streamChat 透传。
+        object["stream"] = stream
         return (try? JSONSerialization.data(withJSONObject: object, options: [.withoutEscapingSlashes])) ?? body
     }
 
