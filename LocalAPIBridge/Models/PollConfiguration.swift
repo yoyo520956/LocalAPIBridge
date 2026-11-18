@@ -9,7 +9,7 @@ enum HTTPMethodOption: String, CaseIterable, Codable, Identifiable, Hashable {
 }
 
 /// 一条自定义请求头。
-struct HeaderPair: Identifiable, Codable, Hashable {
+struct HeaderPair: Identifiable, Codable, Hashable, Sendable {
     var id: UUID
     var key: String
     var value: String

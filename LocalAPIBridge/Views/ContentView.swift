@@ -17,6 +17,12 @@ struct ContentView: View {
                     Label("概览", systemImage: "antenna.radiowaves.left.and.right")
                 }
 
+            RouterView()
+                .environmentObject(engine.router)
+                .tabItem {
+                    Label("AI 路由", systemImage: "arrow.triangle.branch")
+                }
+
             HistoryView()
                 .tabItem {
                     Label("记录", systemImage: "clock.arrow.circlepath")

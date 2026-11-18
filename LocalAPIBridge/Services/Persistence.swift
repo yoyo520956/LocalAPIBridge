@@ -188,3 +188,20 @@ enum LatestResponseStore {
         try? FileManager.default.removeItem(at: metadataURL)
     }
 }
+
+/// AI 多端点路由配置持久化。
+enum RouterConfigurationStore {
+    private static let storageKey = "localapibridge.router.v1"
+
+    static func load() -> RouterConfiguration {
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else {
+            return RouterConfiguration()
+        }
+        return (try? JSONDecoder().decode(RouterConfiguration.self, from: data)) ?? RouterConfiguration()
+    }
+
+    static func save(_ configuration: RouterConfiguration) {
+        guard let data = try? JSONEncoder().encode(configuration) else { return }
+        UserDefaults.standard.set(data, forKey: storageKey)
+    }
+}
