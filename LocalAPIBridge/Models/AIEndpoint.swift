@@ -201,6 +201,9 @@ struct RouteLog: Identifiable, Codable, Equatable {
 }
 
 struct RouterConfiguration: Codable, Equatable {
+    /// 客户端 /v1/models 只暴露这一个模型标识，由路由自动挑真实端点。
+    static let autoModelID = "auto"
+
     var endpoints: [AIEndpoint]
     var subscriptions: [EndpointSubscription]
     var probeIntervalSeconds: Double
@@ -216,7 +219,7 @@ struct RouterConfiguration: Codable, Equatable {
         subscriptions = []
         probeIntervalSeconds = 30
         probeTimeoutSeconds = 2
-        hedgeDelayMilliseconds = 200
+        hedgeDelayMilliseconds = 100
         maxRaceEndpoints = 3
         contextLimitTokens = 128_000
         displayModelName = ""
@@ -231,7 +234,7 @@ struct RouterConfiguration: Codable, Equatable {
         copy.probeTimeoutSeconds = probeTimeoutSeconds.isFinite
             ? min(max(probeTimeoutSeconds, 0.5), 30)
             : 2
-        copy.hedgeDelayMilliseconds = min(max(hedgeDelayMilliseconds, 50), 2_000)
+        copy.hedgeDelayMilliseconds = min(max(hedgeDelayMilliseconds, 20), 2_000)
         copy.maxRaceEndpoints = min(max(maxRaceEndpoints, 1), 5)
         copy.contextLimitTokens = min(max(contextLimitTokens, 100), 10_000_000)
         copy.displayModelName = displayModelName.trimmingCharacters(in: .whitespacesAndNewlines)

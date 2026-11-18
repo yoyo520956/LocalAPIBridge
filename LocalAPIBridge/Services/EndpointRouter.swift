@@ -47,7 +47,7 @@ private enum ProxyAttempt: Sendable {
 /// 多端点 AI 路由：
 /// - 并行探测所有端点，维护“可用 / 延迟 / 冷却”状态；
 /// - 本地 `/v1/chat/completions` 请求按健康排名即时选择端点；
-/// - 首选端点在前 200ms 内没有完成时，按 stagger 并发启动后续端点，先成功者胜出；
+/// - 首选端点在前 100ms 内没有完成时，按 stagger 并发启动后续端点，先成功者胜出；
 /// - 失败端点进入冷却，避免继续拖慢请求。
 @MainActor
 final class EndpointRouter: ObservableObject {
@@ -169,6 +169,79 @@ final class EndpointRouter: ObservableObject {
         lastError = nil
         probeAllNow()
         return (parsed.count, nil)
+    }
+
+    // MARK: - 从 API 获取模型（批量添加端点）
+
+    struct ModelDiscoveryResult: Sendable {
+        var models: [String]
+        var error: String?
+        var suggestedName: String
+    }
+
+    /// 用 Base URL + API Key 直接拉取 `/models`，拿到可用模型 id 列表。
+    func discoverModels(
+        baseURL: String,
+        apiKey: String,
+        apiKeyHeader: String,
+        apiKeyPrefix: String,
+        modelsPath: String
+    ) async -> ModelDiscoveryResult {
+        await Self.fetchModelIDs(
+            baseURL: baseURL,
+            apiKey: apiKey,
+            apiKeyHeader: apiKeyHeader,
+            apiKeyPrefix: apiKeyPrefix,
+            modelsPath: modelsPath,
+            session: session
+        )
+    }
+
+    /// 把选中的模型一次性写成端点（同一 Base URL 下同模型自动跳过重复）。
+    @discardableResult
+    func addEndpoints(
+        baseURL: String,
+        apiKey: String,
+        apiKeyHeader: String,
+        apiKeyPrefix: String,
+        chatPath: String,
+        healthPath: String,
+        models: [String],
+        namePrefix: String
+    ) -> Int {
+        let base = Self.normalizedBaseURL(baseURL)
+        guard !base.isEmpty else { return 0 }
+        let chat = chatPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let health = healthPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let header = apiKeyHeader.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = namePrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        var added = 0
+        for raw in models {
+            let model = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !model.isEmpty else { continue }
+            let exists = configuration.endpoints.contains {
+                $0.trimmedBaseURL == base && $0.model == model
+            }
+            guard !exists else { continue }
+            var endpoint = AIEndpoint()
+            endpoint.name = prefix.isEmpty ? model : "\(prefix) · \(model)"
+            endpoint.baseURL = base
+            endpoint.apiKey = apiKey
+            endpoint.model = model
+            endpoint.apiKeyHeader = header
+            endpoint.apiKeyPrefix = apiKeyPrefix
+            endpoint.healthPath = health.isEmpty ? "/models" : health
+            endpoint.chatPath = chat.isEmpty ? "/chat/completions" : chat
+            configuration.endpoints.append(endpoint)
+            added += 1
+        }
+        guard added > 0 else { return 0 }
+        configuration = configuration.sanitized
+        RouterConfigurationStore.save(configuration)
+        reconcileHealth()
+        lastError = nil
+        probeAllNow()
+        return added
     }
 
     // MARK: - 订阅
@@ -306,7 +379,13 @@ final class EndpointRouter: ObservableObject {
         switch outcome {
         case .healthy(let latency):
             item.state = .healthy
-            item.latencyMilliseconds = latency
+            // 探测延迟只做参考：和最近一次真实对话延迟各占一半，
+            // 避免“/models 很快但出字很慢”的端点被排到前面。
+            if let previous = item.latencyMilliseconds {
+                item.latencyMilliseconds = Int(Double(previous) * 0.5 + Double(latency) * 0.5)
+            } else {
+                item.latencyMilliseconds = latency
+            }
             item.successCount += 1
             item.consecutiveFailures = 0
             item.lastSuccess = Date()
@@ -514,15 +593,15 @@ final class EndpointRouter: ObservableObject {
 
     // MARK: - 对外状态
 
+    /// 客户端只看到一个模型标识：`auto`（自动选路）。
     func modelsPayload() -> [String: Any] {
-        let items: [[String: Any]] = configuration.endpoints.map { endpoint in
-            [
-                "id": endpoint.displayModel,
-                "object": "model",
-                "owned_by": endpoint.displayName
-            ]
-        }
-        return ["object": "list", "data": items]
+        let item: [String: Any] = [
+            "id": RouterConfiguration.autoModelID,
+            "object": "model",
+            "created": 1_767_225_600,
+            "owned_by": "localapibridge"
+        ]
+        return ["object": "list", "data": [item]]
     }
 
     func statusPayload() -> [String: Any] {
@@ -654,6 +733,145 @@ final class EndpointRouter: ObservableObject {
 
     // MARK: - 网络请求
 
+    /// 把用户粘贴的各种形态统一成 Base URL：去掉尾部 `/`，并去掉误粘的
+    /// `/chat/completions`、`/completions`、`/models` 后缀。
+    nonisolated static func normalizedBaseURL(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("/") {
+            value.removeLast()
+        }
+        let suffixes = ["/chat/completions", "/completions", "/models"]
+        for suffix in suffixes where value.hasSuffix(suffix) {
+            value = String(value.dropLast(suffix.count))
+            break
+        }
+        while value.hasSuffix("/") {
+            value.removeLast()
+        }
+        return value
+    }
+
+    nonisolated static func fetchModelIDs(
+        baseURL: String,
+        apiKey: String,
+        apiKeyHeader: String,
+        apiKeyPrefix: String,
+        modelsPath: String,
+        session: URLSession
+    ) async -> ModelDiscoveryResult {
+        let base = Self.normalizedBaseURL(baseURL)
+        let suggestedName = URL(string: base)?.host ?? ""
+        guard let parsedBase = URL(string: base),
+              let scheme = parsedBase.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              parsedBase.host != nil else {
+            return ModelDiscoveryResult(
+                models: [],
+                error: "Base URL 无效，请填完整地址，例如 https://api.example.com/v1",
+                suggestedName: suggestedName
+            )
+        }
+        let rawPath = modelsPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix: String
+        if rawPath.isEmpty {
+            suffix = "/models"
+        } else if rawPath.hasPrefix("/") {
+            suffix = rawPath
+        } else {
+            suffix = "/" + rawPath
+        }
+        guard let url = URL(string: base + suffix) else {
+            return ModelDiscoveryResult(models: [], error: "模型列表地址无效", suggestedName: suggestedName)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headerName = apiKeyHeader.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty {
+            let name = headerName.isEmpty ? "Authorization" : headerName
+            request.setValue(apiKeyPrefix + key, forHTTPHeaderField: name)
+        }
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return ModelDiscoveryResult(models: [], error: "非 HTTP 响应", suggestedName: suggestedName)
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let preview = String(data: data.prefix(200), encoding: .utf8) ?? ""
+                return ModelDiscoveryResult(
+                    models: [],
+                    error: "HTTP \(http.statusCode) \(preview)",
+                    suggestedName: suggestedName
+                )
+            }
+            let models = Self.parseModelIDs(data)
+            if models.isEmpty {
+                return ModelDiscoveryResult(
+                    models: [],
+                    error: "返回里没找到模型字段（支持 data[].id、models[].id 或字符串数组）",
+                    suggestedName: suggestedName
+                )
+            }
+            return ModelDiscoveryResult(models: models, error: nil, suggestedName: suggestedName)
+        } catch {
+            return ModelDiscoveryResult(models: [], error: error.localizedDescription, suggestedName: suggestedName)
+        }
+    }
+
+    nonisolated static func parseModelIDs(_ data: Data) -> [String] {
+        var ids: [String] = []
+        let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        if let dictionary = object as? [String: Any] {
+            if let list = dictionary["data"] as? [[String: Any]] {
+                for item in list {
+                    if let id = Self.stringValue(item, keys: ["id", "name", "model"]) {
+                        ids.append(id)
+                    }
+                }
+            } else if let list = dictionary["models"] as? [[String: Any]] {
+                for item in list {
+                    if let id = Self.stringValue(item, keys: ["id", "name", "model"]) {
+                        ids.append(id)
+                    }
+                }
+            } else if let list = dictionary["data"] as? [String] {
+                ids.append(contentsOf: list)
+            } else if let list = dictionary["models"] as? [String] {
+                ids.append(contentsOf: list)
+            } else if let nested = dictionary["data"] as? [String: Any] {
+                if let list = nested["models"] as? [[String: Any]] {
+                    for item in list {
+                        if let id = Self.stringValue(item, keys: ["id", "name", "model"]) {
+                            ids.append(id)
+                        }
+                    }
+                }
+            }
+        } else if let list = object as? [[String: Any]] {
+            for item in list {
+                if let id = Self.stringValue(item, keys: ["id", "name", "model"]) {
+                    ids.append(id)
+                }
+            }
+        } else if let list = object as? [String] {
+            ids.append(contentsOf: list)
+        }
+
+        var seen = Set<String>()
+        var unique: [String] = []
+        for raw in ids {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            unique.append(trimmed)
+        }
+        return unique.sorted()
+    }
+
     private nonisolated static func probe(
         _ endpoint: AIEndpoint,
         timeout: TimeInterval,
@@ -769,8 +987,13 @@ final class EndpointRouter: ObservableObject {
               var object = raw as? [String: Any] else {
             return body
         }
-        if !model.isEmpty {
-            object["model"] = model
+        let requested = (object["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let target = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !target.isEmpty {
+            object["model"] = target
+        } else if requested.isEmpty || requested.caseInsensitiveCompare(RouterConfiguration.autoModelID) == .orderedSame {
+            // 客户端选了“自动”但这个端点没固定模型：交给上游默认模型。
+            object.removeValue(forKey: "model")
         }
         // 本地代理先统一走非流式，拿到完整 JSON 后一次性返回。
         object["stream"] = false
