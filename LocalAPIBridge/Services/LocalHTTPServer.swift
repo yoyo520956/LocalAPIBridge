@@ -256,7 +256,7 @@ final class LocalHTTPServer {
                     self.respond(headerData: headerData, bodyData: bodyData, on: connection)
                     return
                 }
-                if accumulated.count > 1_048_576 {
+                if accumulated.count > 8_388_608 {
                     self.send(
                         HTTPReply.json(status: 413, payload: ["ok": false, "error": "请求体过大"]),
                         on: connection
