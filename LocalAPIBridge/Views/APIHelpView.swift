@@ -19,7 +19,7 @@ struct APIHelpView: View {
                 endpoint("GET /history?limit=20", "最近轮询记录，limit 最大 200")
                 endpoint("POST /refresh", "立即触发一次单接口轮询，返回 202")
                 endpoint("POST /v1/chat/completions", "AI 路由代理，选择当前最优端点并返回完整 JSON（不支持流式）")
-                endpoint("GET /v1/models", "列出 AI 路由里配置的端点/模型")
+                endpoint("GET /v1/models", "只返回一个 auto 模型，真实端路由后台自动选")
                 endpoint("GET /router/status", "所有 AI 端点的健康、延迟、排名和统计")
                 endpoint("GET /router/best", "当前最优 AI 端点（不含 API Key）")
                 endpoint("POST /router/refresh", "立即重新探测所有 AI 端点")

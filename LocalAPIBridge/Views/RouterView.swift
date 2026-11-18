@@ -9,12 +9,13 @@ struct RouterView: View {
     @State private var subscriptionText = ""
     @State private var probeInterval = 30.0
     @State private var probeTimeout = 2.0
-    @State private var hedgeMilliseconds = 200
+    @State private var hedgeMilliseconds = 100
     @State private var maxRace = 3
     @State private var contextLimit = 128_000
     @State private var displayModel = ""
     @State private var monitoring = true
     @State private var showEditor = false
+    @State private var showModelImport = false
     @State private var editingEndpoint: AIEndpoint?
     @State private var showAdvanced = false
     @State private var loaded = false
@@ -63,6 +64,15 @@ struct RouterView: View {
                         isNew: editingEndpoint == nil
                     )
                     .environmentObject(router)
+                }
+            }
+            .sheet(isPresented: $showModelImport, onDismiss: {
+                endpointJSON = router.manualEndpointsJSON()
+                subscriptionText = router.subscriptionURLsText
+            }) {
+                NavigationStack {
+                    ModelImportView()
+                        .environmentObject(router)
                 }
             }
             .alert(alertTitle, isPresented: $showAlert) {
@@ -179,6 +189,12 @@ struct RouterView: View {
             } label: {
                 Label("添加端点", systemImage: "plus.circle")
             }
+
+            Button {
+                showModelImport = true
+            } label: {
+                Label("粘贴 API + Key，一键获取模型", systemImage: "square.stack.3d.up")
+            }
         } header: {
             Text("端点（\(router.configuration.endpoints.count)）")
         } footer: {
@@ -256,7 +272,7 @@ struct RouterView: View {
                 }
             }
 
-            Stepper(value: $hedgeMilliseconds, in: 50...1_000, step: 50) {
+            Stepper(value: $hedgeMilliseconds, in: 20...1_000, step: 20) {
                 HStack {
                     Text("并发兜底延迟")
                     Spacer()
@@ -295,7 +311,7 @@ struct RouterView: View {
         } header: {
             Text("路由参数")
         } footer: {
-            Text("探测使用每个端点的健康检查路径；0.2 秒指的是选路/并发兜底的启动延迟，不是模型完整回答的时间。免费 API 慢，实际回答仍取决于上游。")
+            Text("选路本身是本地健康排名，0 网络等待；默认 0.1 秒内首端点没返回就并发下一个，先成功者胜出。0.1 秒指的是“锁定并开打”的时间，不是模型完整回答的时间。")
         }
     }
 
@@ -504,6 +520,17 @@ private struct EndpointEditorView: View {
                     .autocorrectionDisabled()
             }
 
+            Section {
+                NavigationLink {
+                    ModelImportView(baseURL: draft.trimmedBaseURL, apiKey: draft.apiKey)
+                        .environmentObject(router)
+                } label: {
+                    Label("获取模型并批量添加", systemImage: "square.stack.3d.up")
+                }
+            } footer: {
+                Text("用上面的 Base URL 和 API Key 拉取模型列表，勾选后一次性生成多个端点。")
+            }
+
             Section("路径与鉴权") {
                 TextField("健康检查路径", text: $draft.healthPath)
                     .textInputAutocapitalization(.never)
@@ -556,6 +583,194 @@ private struct EndpointEditorView: View {
         }
         draft.baseURL = base
         router.upsertEndpoint(draft)
+        dismiss()
+    }
+}
+// MARK: - 从 API 获取模型
+
+private struct ModelImportView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var router: EndpointRouter
+
+    @State private var baseURL: String
+    @State private var apiKey: String
+    @State private var apiKeyHeader = "Authorization"
+    @State private var apiKeyPrefix = "Bearer "
+    @State private var modelsPath = "/models"
+    @State private var models: [String] = []
+    @State private var selected: Set<String> = []
+    @State private var isFetching = false
+    @State private var errorMessage: String?
+
+    init(baseURL: String = "", apiKey: String = "") {
+        _baseURL = State(initialValue: baseURL)
+        _apiKey = State(initialValue: apiKey)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                TextField("Base URL，例如 https://api.example.com/v1", text: $baseURL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("API Key", text: $apiKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } header: {
+                Text("API")
+            } footer: {
+                Text("粘贴 Base URL（一般到 /v1）和密钥，点“获取模型”。粘成 .../chat/completions 也会自动修正。")
+            }
+
+            Section {
+                Button {
+                    Task { await fetchModels() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if isFetching {
+                            ProgressView()
+                        }
+                        Text(isFetching ? "正在获取模型…" : "获取模型")
+                    }
+                }
+                .disabled(isFetching || baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                DisclosureGroup("鉴权与路径") {
+                    TextField("鉴权请求头", text: $apiKeyHeader)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("鉴权前缀", text: $apiKeyPrefix)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("模型列表路径", text: $modelsPath)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+            }
+
+            if let message = errorMessage {
+                Section {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            }
+
+            if !models.isEmpty {
+                Section {
+                    HStack(spacing: 12) {
+                        Button("全选") {
+                            selected = Set(models)
+                        }
+                        Button("清空") {
+                            selected.removeAll()
+                        }
+                        Spacer()
+                        Text("\(selected.count)/\(models.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+
+                    ForEach(models, id: \.self) { model in
+                        Button {
+                            toggle(model)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: selected.contains(model) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(selected.contains(model) ? Color.accentColor : Color.secondary)
+                                Text(model)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text("模型（\(models.count)）")
+                } footer: {
+                    Text("每个模型会生成一个端点，全部参与自动探测和竞速选路。")
+                }
+
+                Section {
+                    Button {
+                        selected = Set(models)
+                        addSelected()
+                    } label: {
+                        Label("一键全选并添加全部（\(models.count) 个）", systemImage: "plus.circle.fill")
+                    }
+
+                    Button {
+                        addSelected()
+                    } label: {
+                        Label("只添加选中的 \(selected.count) 个", systemImage: "checkmark.circle")
+                    }
+                    .disabled(selected.isEmpty)
+                }
+            }
+        }
+        .navigationTitle("获取模型")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button("关闭") { dismiss() }
+            }
+        }
+    }
+
+    private func toggle(_ model: String) {
+        if selected.contains(model) {
+            selected.remove(model)
+        } else {
+            selected.insert(model)
+        }
+    }
+
+    private func fetchModels() async {
+        isFetching = true
+        errorMessage = nil
+        let result = await router.discoverModels(
+            baseURL: baseURL,
+            apiKey: apiKey,
+            apiKeyHeader: apiKeyHeader,
+            apiKeyPrefix: apiKeyPrefix,
+            modelsPath: modelsPath
+        )
+        isFetching = false
+        if let error = result.error {
+            models = []
+            selected = []
+            errorMessage = error
+            return
+        }
+        models = result.models
+        selected = Set(result.models)
+        if models.isEmpty {
+            errorMessage = "没有取到模型，检查 Key 或模型列表路径"
+        }
+    }
+
+    private func addSelected() {
+        let list = models.filter { selected.contains($0) }
+        guard !list.isEmpty else { return }
+        let host = URL(string: EndpointRouter.normalizedBaseURL(baseURL))?.host ?? ""
+        let added = router.addEndpoints(
+            baseURL: baseURL,
+            apiKey: apiKey,
+            apiKeyHeader: apiKeyHeader,
+            apiKeyPrefix: apiKeyPrefix,
+            chatPath: "/chat/completions",
+            healthPath: modelsPath.isEmpty ? "/models" : modelsPath,
+            models: list,
+            namePrefix: host
+        )
+        if added == 0 {
+            errorMessage = "这些模型已经有端点了，换一个 API 或先删掉旧的。"
+            return
+        }
         dismiss()
     }
 }
