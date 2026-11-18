@@ -20,6 +20,7 @@ final class PollingEngine: ObservableObject {
     @Published private(set) var failureCount: Int = 0
 
     let store = BridgeStore()
+    let router = EndpointRouter()
 
     private let session: URLSession
     private var server: LocalHTTPServer?
@@ -109,6 +110,8 @@ final class PollingEngine: ObservableObject {
         if server == nil {
             server = makeServer()
         }
+        server?.router = router
+        router.bootstrap()
         serverState = .starting
         server?.start(port: configuration.normalizedPort, serviceName: serviceName)
         refreshAddresses()
@@ -451,7 +454,7 @@ final class PollingEngine: ObservableObject {
     // MARK: - 本地服务
 
     private func makeServer() -> LocalHTTPServer {
-        LocalHTTPServer(
+        let server = LocalHTTPServer(
             store: store,
             onRefreshRequest: { [weak self] in
                 guard let self else { return }
@@ -466,6 +469,8 @@ final class PollingEngine: ObservableObject {
                 }
             }
         )
+        server.router = router
+        return server
     }
 
     private func handleServerState(_ state: LocalServerState) {
@@ -489,6 +494,8 @@ final class PollingEngine: ObservableObject {
         if server == nil {
             server = makeServer()
         }
+        server?.router = router
+        router.bootstrap()
         serverState = .starting
         server?.restart(port: configuration.normalizedPort, serviceName: serviceName)
     }
@@ -516,6 +523,17 @@ final class PollingEngine: ObservableObject {
 
     /// 画中画浮窗显示的数据：优先取最近一次成功记录里的模型/token 信息。
     func pipStatusData() -> PiPStatusData {
+        if let routerInfo = router.pipInfo() {
+            return PiPStatusData(
+                modelName: routerInfo.modelName,
+                contextUsed: routerInfo.tokensUsed,
+                contextLimit: routerInfo.contextLimit,
+                serverRunning: serverState.isRunning,
+                polling: router.configuration.monitoringEnabled,
+                pollCount: router.requestCount,
+                successCount: router.successCount
+            )
+        }
         let successfulRecord = latestRecord?.success == true
             ? latestRecord
             : history.first(where: { $0.success })
