@@ -246,10 +246,10 @@ iOS 不允许普通 App 永久在后台运行。本 App 提供三种延长存活
 设置 → 后台常驻 → **画中画保活（显示运行信息）**。
 
 - 使用 iOS 原生画中画（`AVPictureInPictureVideoCallViewController`），不是录屏或网页模拟；
-- 切到后台时自动出现浮窗；也可以在前台点“立即开启画中画”；
+- 切到其它 App / 回到桌面时自动出现浮窗；锁屏时 iPhone 通常不显示 PiP 浮窗，但音频会话仍尽量维持后台运行；也可以在前台点“立即开启画中画”；
 - 浮窗内容每秒刷新：
   - **模型**：优先读取上游 JSON 的 `model` / `model_name` / `model_id`；读不到时用设置里填写的“显示模型名称”；
-  - **上下文**：读取 `usage.total_tokens`、`prompt_tokens + completion_tokens`、`context_tokens`、`tokens_used` 等字段，并按“上下文上限（tokens）”计算百分比；
+  - **上下文**：读取 `usage.total_tokens`、`prompt_tokens + completion_tokens`、`context_tokens`、`tokens_used` 等字段，并按“上下文上限（tokens）”计算百分比；这是**最近一次成功响应的 token 用量**，不是整个会话的累计上下文；
   - **时间**：当前时间 `HH:mm:ss`；
   - **系统运行**：`ProcessInfo.systemUptime`，单位秒（设备本次开机以来的秒数）；
   - 底部还有本 App 运行秒数和累计轮询/成功次数；
