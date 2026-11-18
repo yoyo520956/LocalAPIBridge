@@ -241,7 +241,8 @@ print(String(decoding: data, as: UTF8.self))
 - Base URL 粘成 `.../chat/completions`、`.../models` 会自动修正回 Base；
 - 模型列表支持 `data[].id`、`models[].id`、`data: ["a","b"]` 与字符串数组几种常见格式；
 - 同一个 Base URL 下已经存在的模型会自动跳过，不会重复添加；
-- 添加完立即开始后台探测，**不需要再手动点任何按钮**。
+- 添加完立即开始后台探测，**不需要再手动点任何按钮**；
+- 模型很多的站点（有些免费站会返回上百个模型）建议只勾常用的几个：每个模型都是一个端点，会各自参与每 30 秒一轮的探测与竞速，全选上百个会明显增加请求量。
 
 ### 6.2 手动添加 / 编辑端点
 
@@ -282,6 +283,8 @@ AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启
 - 首选端点 **0.1 秒（默认 hedge 延迟，可调 20–1000ms）** 内没有返回，就并发启动第 2 个；再过 100ms 启动第 3 个，**先成功者返回**，其余取消；
 - 真实请求失败 / 429 / 5xx 也会更新健康状态并进入冷却（5–300 秒；401/403 冷却 10 分钟），下一次请求自动绕开；
 - 注意：0.1 秒指**选路 + 兜底启动**的时间，不是模型完整回答的时间；免费 API 出字速度仍取决于上游；
+- 探测被取消（保存设置、开关监控、手动刷新叠加）不再算失败，不会把端点误打进冷却；
+- 健康检查路径返回 404/405（很多免费中转站没有 `/models`）只记录错误、不降级，端点仍可正常参与聊天选路；
 - 竞速会向上游发重复请求（最多 `maxRaceEndpoints` 个，默认 3）。额度紧张时把“最多并发端点”设为 2，或把“并发兜底延迟”调到 300ms 以上，只保留快速失败切换。
 
 ### 6.5 本地 AI 入口（OpenAI 兼容）
@@ -519,7 +522,7 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
-当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `a9ca798`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒并发兜底、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有新界面字符串（例如“一键全选并添加全部”），并已通过 Release 下载校验。
+当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `36ce383`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒并发兜底、探测状态机加固、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有新界面字符串（例如“一键全选并添加全部”），并已通过 Release 下载校验。
 
 ### 13.1 下载
 
@@ -542,14 +545,14 @@ https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/downloa
 SHA256：
 
 ```
-83a8c360d01c5f63ae67c4449ec073be1029241b21f1d4ad2ab311df47cd3066
+8b1065041597d3ff9eb7c222453325f1d55e60de89e12b45e00e5bfd34104311
 ```
 
-文件大小：`924267` 字节（约 903 KB）。
+文件大小：`926422` 字节（约 905 KB）。
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
 >
-> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944 字节（最早的无 AI 路由版）和 886022 字节（0.2 秒版）两个旧包；只要大小不是 `924267` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
+> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）三个旧包；只要大小不是 `926422` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
 
 ### 13.2 为什么是“未签名”IPA？
 
