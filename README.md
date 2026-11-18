@@ -48,6 +48,10 @@
 | 模型与上下文 | 自动读取上游 JSON 的 `model`、`usage.total_tokens` 等字段 |
 | 屏幕常亮 | 可选，调试或需要长时间前台运行时使用 |
 | 示例接口 | Open-Meteo、Hitokoto、汇率、GitHub Zen、ipify |
+| AI 多端点 | 多个自定义 AI API，按健康状态/延迟自动排序 |
+| 订阅导入 | 一个 URL 批量导入端点，6 小时自动刷新 |
+| 200ms 兜底 | 首选 200ms 未完成时并发启动后续端点，先成功者胜出 |
+| 本地 AI 入口 | `POST /v1/chat/completions`（OpenAI 兼容，非流式） |
 
 ---
 
@@ -76,7 +80,7 @@
 
 ### 不想本地构建？
 
-仓库 [yoyo520956/LocalAPIBridge](https://github.com/yoyo520956/LocalAPIBridge) 配了 GitHub Actions：推送代码后自动在 macOS runner 上构建 **未签名 IPA**，并发布到 Releases。详见第 12 节。
+仓库 [yoyo520956/LocalAPIBridge](https://github.com/yoyo520956/LocalAPIBridge) 配了 GitHub Actions：推送代码后自动在 macOS runner 上构建 **未签名 IPA**，并发布到 Releases。详见第 13 节。
 
 ### 命令行构建（可选）
 
@@ -223,7 +227,88 @@ print(String(decoding: data, as: UTF8.self))
 
 ---
 
-## 6. 后台保活：音频 / 画中画 / 屏幕常亮
+## 6. AI 多端点路由（重点）
+
+原来的“单 URL 轮询并缓存”仍然保留；新的 **AI 路由** 面向“很多免费 AI API / 订阅，自动挑最快可用”的场景。
+
+### 6.1 添加端点
+
+AI 路由 tab → 右上角 `+`：
+
+| 字段 | 说明 |
+|---|---|
+| 名称 | 自定义显示名 |
+| Base URL | 一般填到 `/v1`，例如 `https://api.example.com/v1` |
+| API Key | 上游密钥；留空则透传本地客户端带来的 `Authorization` |
+| 模型 | 留空则使用客户端请求 JSON 里的 `model` |
+| 健康检查路径 | 默认 `/models`；留空则不做主动探测 |
+| 聊天路径 | 默认 `/chat/completions` |
+| 鉴权头 / 前缀 | 默认 `Authorization` / `Bearer `，可改成 `X-API-Key` 等 |
+| 优先级 | 同健康状态、同延迟时的排序 |
+
+端点可以单独启用/停用；批量导入在页面底部“高级 → 批量导入手动端点 JSON”，字段为 `name`、`base_url`、`api_key`、`model`、`headers`、`health_path`、`chat_path`、`priority`、`enabled`。
+
+### 6.2 订阅导入
+
+AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启动时超过 6 小时的订阅会自动重新拉取。
+
+订阅内容支持：
+
+- JSON 数组：`[{"name":"free1","base_url":"https://.../v1","api_key":"sk-...","model":"gpt-4o-mini"}]`
+- JSON 对象：`{"endpoints":[...]}` 或 `{"data":[...]}`
+- 逐行文本：`名称|BaseURL|Key|模型`，或 `BaseURL|Key|模型`
+- 每项还支持 `headers`、`health_path`、`chat_path`、`priority`、`enabled`、`api_key_header`、`api_key_prefix`
+
+订阅端点与手动端点分开管理；刷新时按 `BaseURL + model + api_key` 复用原有端点 ID，避免健康状态被重置。
+
+### 6.3 自动探测与“0.2 秒锁定”
+
+- 后台并行探测所有启用端点，默认每 30 秒一轮，单次超时 2 秒，每批最多 6 个并发；
+- 维护每个端点的状态：**可用 / 未探测 / 降级 / 冷却**，并记录最近延迟、成功/失败次数、最近错误；
+- 选路排名：可用（按延迟从低到高）→ 未探测 → 降级 → 冷却；
+- `/v1/chat/completions` 到来时**直接取排名第一**，不逐个探测，所以“锁定可用端点”是毫秒级；
+- 首选端点在 **hedge 延迟（默认 200ms）** 内没有完成时，按 200ms 阶梯自动并发启动第 2、第 3 个端点，**先成功者返回**，其余取消；
+- 真实请求失败 / 429 / 5xx 也会更新健康状态并进入冷却（5–300 秒；401/403 冷却 10 分钟）；
+- 注意：这里的 0.2 秒指**选路 + 兜底启动延迟**，不是模型完整回答的时间；免费 API 的实际出字速度仍取决于上游；
+- 竞速会向上游发重复请求（最多 `maxRaceEndpoints` 个）。把“最多并发端点”设为 1 即可关闭竞速，只保留快速失败切换。
+
+### 6.4 本地 AI 入口（OpenAI 兼容）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/chat/completions` | 代理到当前最优端点；统一 `stream=false`，返回完整 JSON |
+| GET | `/v1/models` | 列出已配置端点/模型 |
+| GET | `/router/status` | 所有端点健康状态、延迟、排名、统计 |
+| GET | `/router/best` | 当前最优端点信息（不返回 API Key） |
+| POST | `/router/refresh` | 立即重新探测所有端点 |
+
+示例：
+
+```bash
+curl -X POST "http://127.0.0.1:8787/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"ignored-if-endpoint-model-set","messages":[{"role":"user","content":"你好"}],"stream":false}'
+
+curl "http://127.0.0.1:8787/router/status"
+curl "http://127.0.0.1:8787/router/best"
+```
+
+说明：
+
+- 上游 Key 优先用端点里配置的；为空时把本地请求的 `Authorization` 透传给上游；
+- 端点模型非空时会覆盖请求体里的 `model`；
+- 目前**不支持 SSE 流式透传**，会把 `stream` 强制为 `false`，返回完整 JSON；需要流式的客户端请先关流式；
+- 暂不支持 chunked 请求体；OpenAI SDK / curl 默认的 JSON 请求没问题；
+- 返回的是上游原始响应体，Content-Type 原样带回；
+- 如果所有端点都失败，返回 JSON 错误（503），并带最后一次失败信息。
+
+### 6.5 画中画显示
+
+配置了 AI 多端点后，画中画浮窗的“模型 / 上下文”优先使用 AI 路由的当前最优端点与最近一次代理响应里的 token 用量；没配置端点时回退到原来的单接口轮询记录。
+
+---
+
+## 7. 后台保活：音频 / 画中画 / 屏幕常亮
 
 iOS 不允许普通 App 永久在后台运行。本 App 提供三种延长存活的手段：
 
@@ -233,7 +318,7 @@ iOS 不允许普通 App 永久在后台运行。本 App 提供三种延长存活
 | **画中画保活**（默认关闭） | 系统画中画浮窗持续显示运行信息，App 保持活跃 | 耗电；用视频通话 PiP 做非通话用途，上架审核有风险 |
 | **屏幕保持常亮**（默认关闭） | 前台长期运行，最稳定 | 屏幕一直亮着，耗电且烧屏风险 |
 
-### 6.1 静音音频
+### 7.1 静音音频
 
 - App 声明 `UIBackgroundModes = audio`，循环播放一段 1 秒的静音 WAV；
 - 锁屏、切到其他 App、甚至长时间待机，本地端口和轮询都继续工作；
@@ -241,7 +326,7 @@ iOS 不允许普通 App 永久在后台运行。本 App 提供三种延长存活
 - 低电量模式、系统内存紧张、长时间不活动时，系统仍可能终止 App；
 - 被终止后重新打开 App，服务与轮询会自动恢复。
 
-### 6.2 画中画（PiP）保活
+### 7.2 画中画（PiP）保活
 
 设置 → 后台常驻 → **画中画保活（显示运行信息）**。
 
@@ -263,7 +348,7 @@ iOS 不允许普通 App 永久在后台运行。本 App 提供三种延长存活
 
 ---
 
-## 7. 工程结构
+## 8. 工程结构
 
 ```
 LocalAPIBridge/
@@ -272,7 +357,8 @@ LocalAPIBridge/
 ├── Models/
 │   ├── PollConfiguration.swift        # 轮询配置 + 校验 + 编解码
 │   ├── APIPreset.swift                # 免费接口示例
-│   └── PollRecord.swift               # 一次轮询结果（可持久化）
+│   ├── PollRecord.swift               # 一次轮询结果（可持久化）
+│   └── AIEndpoint.swift               # AI 端点 / 订阅 / 健康 / 路由配置
 ├── Services/
 │   ├── BridgeStore.swift              # 引擎 ↔ HTTP 服务的线程安全共享状态
 │   ├── Persistence.swift              # UserDefaults 配置 + 历史 JSON 文件
@@ -280,11 +366,13 @@ LocalAPIBridge/
 │   ├── SilentAudio.swift              # 生成/复用静音 WAV
 │   ├── BackgroundKeeper.swift         # 静音音频 / 屏幕常亮
 │   ├── PiPStatusController.swift      # 原生画中画 + 运行信息浮窗
-│   ├── PollingEngine.swift            # 自动轮询、状态、服务生命周期
-│   └── LocalHTTPServer.swift          # NWListener + 手写 HTTP/1.1 路由
+│   ├── PollingEngine.swift            # 单接口轮询、服务生命周期
+│   ├── EndpointRouter.swift           # 多端点健康探测 / 排名 / 竞速代理
+│   └── LocalHTTPServer.swift          # NWListener + 路由 + AI 代理
 ├── Views/
 │   ├── ContentView.swift              # TabView + 画中画锚点
 │   ├── HomeView.swift                 # 概览、地址、二维码、最新结果
+│   ├── RouterView.swift               # AI 多端点 / 订阅 / 路由参数 / 日志
 │   ├── HistoryView.swift              # 记录列表与详情
 │   ├── SettingsView.swift             # 全部配置
 │   └── APIHelpView.swift              # App 内 API 说明
@@ -317,7 +405,7 @@ LocalHTTPServer（NWListener + 自定义队列）◄── 本机 App / 局域�
 
 ---
 
-## 8. 安全建议
+## 9. 安全建议
 
 - 在公共 Wi-Fi 或宿舍/办公室网络里，**务必设置访问令牌**；本地服务没有 HTTPS。
 - 不要在路由器上把 8787 端口映射到公网；这个 App 只适合局域网。
@@ -327,7 +415,7 @@ LocalHTTPServer（NWListener + 自定义队列）◄── 本机 App / 局域�
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 **电脑打不开 `http://IP:8787`**
 
@@ -368,7 +456,7 @@ LocalHTTPServer（NWListener + 自定义队列）◄── 本机 App / 局域�
 
 ---
 
-## 10. 辅助脚本（可选）
+## 11. 辅助脚本（可选）
 
 这些脚本只用于生成/检查工程，不影响 App 运行：
 
@@ -388,11 +476,13 @@ python3 tools/make_icon.py
 
 ---
 
-## 11. 已知限制
+## 12. 已知限制
 
 - 这是 **HTTP** 服务，不是 HTTPS；局域网内明文传输。
 - 不支持 WebSocket、HTTP/2、chunked 请求体、长连接复用。
 - 只保留最近 100 条记录；每条响应体最多保存 6000 字符（最新完整响应保存在内存中，并最多缓存 2 MB 到磁盘）。
+- AI 代理暂不支持 SSE 流式透传，会强制 `stream=false` 并返回完整 JSON；也不支持 chunked 请求体。
+- 多端点竞速默认会同时请求最多 3 个端点；如果不希望重复请求，把“最多并发端点”改成 1。
 - 累计轮询次数会持久化保存，历史列表只展示最近 100 条。
 - 上游响应完全原样缓存；如果上游是二进制，`/latest` 会原样返回，但历史记录里只显示大小。
 - 后台保活不是“永不掉线”，iOS 始终保留终止 App 的权力。
@@ -403,7 +493,7 @@ python3 tools/make_icon.py
 
 ---
 
-## 12. GitHub Actions 自动打包（未签名 IPA）
+## 13. GitHub Actions 自动打包（未签名 IPA）
 
 仓库：<https://github.com/yoyo520956/LocalAPIBridge>
 
@@ -416,7 +506,7 @@ python3 tools/make_icon.py
 
 当前这次构建已在 GitHub Actions 的 macOS runner 上成功完成，产出的 IPA 内含 arm64 Mach-O、`UIBackgroundModes=audio`、Bundle ID `com.yoyo520956.localapibridge`，并通过了 Release 下载校验。
 
-### 12.1 下载
+### 13.1 下载
 
 Release 页面：<https://github.com/yoyo520956/LocalAPIBridge/releases/tag/v1.0.0>
 
@@ -442,7 +532,7 @@ SHA256：
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
 
-### 12.2 为什么是“未签名”IPA？
+### 13.2 为什么是“未签名”IPA？
 
 签名必须使用 **你自己的 Apple ID / 开发者证书**。GitHub runner 上没有你的证书和描述文件，也不能代替你在设备上完成 Apple ID 双因素登录，所以只能产出未签名包。
 
@@ -459,6 +549,6 @@ SHA256：
 
 ---
 
-## 13. 许可
+## 14. 许可
 
 仅供个人学习与自用。使用任何第三方免费 API 时请遵守其服务条款与频率限制。
