@@ -364,8 +364,8 @@ final class LocalHTTPServer {
             return
         }
         if method == "POST", path == "/router/refresh" {
-            Task { @MainActor [weak self] in
-                self?.router?.probeAllNow()
+            Task { @MainActor in
+                self.router?.probeAllNow()
             }
             send(.json(status: 202, payload: ["ok": true, "queued": true]), on: connection)
             return
@@ -389,8 +389,7 @@ final class LocalHTTPServer {
             send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
             return
         }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        Task { @MainActor in
             let reply = await router.proxyChat(body: bodyData, incomingHeaders: headers)
             let httpReply = HTTPReply.data(
                 status: reply.statusCode,
@@ -407,8 +406,7 @@ final class LocalHTTPServer {
             send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
             return
         }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        Task { @MainActor in
             let reply: HTTPReply
             switch kind {
             case .models:
