@@ -48,7 +48,15 @@ struct RouterView: View {
             .onAppear {
                 loadIfNeeded()
             }
-            .sheet(isPresented: $showEditor) {
+            .onChange(of: showAdvanced) { expanded in
+                if expanded {
+                    endpointJSON = router.manualEndpointsJSON()
+                }
+            }
+            .sheet(isPresented: $showEditor, onDismiss: {
+                endpointJSON = router.manualEndpointsJSON()
+                subscriptionText = router.subscriptionURLsText
+            }) {
                 NavigationStack {
                     EndpointEditorView(
                         endpoint: editingEndpoint ?? AIEndpoint(),

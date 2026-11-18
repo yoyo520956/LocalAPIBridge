@@ -17,7 +17,12 @@ struct APIHelpView: View {
                 endpoint("GET /latest?pretty=1", "把 JSON 美化后返回，方便调试")
                 endpoint("GET /json", "带元信息的 JSON 包装，上游内容放在 body 字段")
                 endpoint("GET /history?limit=20", "最近轮询记录，limit 最大 200")
-                endpoint("POST /refresh", "立即触发一次轮询，返回 202")
+                endpoint("POST /refresh", "立即触发一次单接口轮询，返回 202")
+                endpoint("POST /v1/chat/completions", "AI 路由代理，选择当前最优端点并返回完整 JSON（不支持流式）")
+                endpoint("GET /v1/models", "列出 AI 路由里配置的端点/模型")
+                endpoint("GET /router/status", "所有 AI 端点的健康、延迟、排名和统计")
+                endpoint("GET /router/best", "当前最优 AI 端点（不含 API Key）")
+                endpoint("POST /router/refresh", "立即重新探测所有 AI 端点")
             } header: {
                 Text("接口列表")
             } footer: {
@@ -32,6 +37,7 @@ struct APIHelpView: View {
 
             Section("示例") {
                 code("curl http://127.0.0.1:\(port)/latest")
+                code("curl -X POST http://127.0.0.1:\(port)/v1/chat/completions -H \"Content-Type: application/json\" -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}'")
                 code("curl -X POST http://127.0.0.1:\(port)/refresh")
                 code("curl \"http://192.168.1.23:\(port)/latest?pretty=1\"")
                 code("curl -H \"X-API-Key: 你的令牌\" http://192.168.1.23:\(port)/status")
