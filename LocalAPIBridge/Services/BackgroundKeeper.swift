@@ -46,10 +46,7 @@ final class BackgroundKeeper: ObservableObject {
             player?.stop()
             player = nil
             isActive = false
-            if sessionActivated {
-                try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-                sessionActivated = false
-            }
+            sessionActivated = false
             lastError = error.localizedDescription
             return false
         }
@@ -63,10 +60,8 @@ final class BackgroundKeeper: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
             interruptionObserver = nil
         }
-        if sessionActivated {
-            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-            sessionActivated = false
-        }
+        // 不主动 deactivate：画中画可能正在共用这个音频会话。
+        sessionActivated = false
     }
 
     /// 调试 / 长时间观察时让屏幕不自动锁定（由用户在设置里手动开启）。
