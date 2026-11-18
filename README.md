@@ -368,7 +368,7 @@ LocalAPIBridge/
 │   ├── PiPStatusController.swift      # 原生画中画 + 运行信息浮窗
 │   ├── PollingEngine.swift            # 单接口轮询、服务生命周期
 │   ├── EndpointRouter.swift           # 多端点健康探测 / 排名 / 竞速代理
-│   └── LocalHTTPServer.swift          # NWListener + 路由 + AI 代理
+│   └── LocalHTTPServer.swift          # NWListener + HTTP 路由 + AI 代理
 ├── Views/
 │   ├── ContentView.swift              # TabView + 画中画锚点
 │   ├── HomeView.swift                 # 概览、地址、二维码、最新结果
@@ -504,7 +504,7 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
-当前这次构建已在 GitHub Actions 的 macOS runner 上成功完成，产出的 IPA 内含 arm64 Mach-O、`UIBackgroundModes=audio`、Bundle ID `com.yoyo520956.localapibridge`，并通过了 Release 下载校验。
+当前这次构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `49c1d73`，已包含 AI 多端点路由、8 MB 请求体上限），产出的 IPA 内含 arm64 Mach-O（2.0 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，并已通过 Release 下载校验。
 
 ### 13.1 下载
 
@@ -527,10 +527,14 @@ https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/downloa
 SHA256：
 
 ```
-26d12bab3db09fc14dfc91cdf967411da712b9d8baaebc4f36a7b1842935afa5
+73ef977916c1ec98bf76c445b696891a27a0b8f714c93cc2a11578b48b8e2ca5
 ```
 
+文件大小：`886022` 字节（约 866 KB）。
+
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
+>
+> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256；如果拿到的是 696944 字节（旧版、不含 AI 路由），在加速链接末尾加一个查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。实测本次 `gh-proxy.com` 返回的是新包，`ghfast.top` 当时返回了旧包。
 
 ### 13.2 为什么是“未签名”IPA？
 
