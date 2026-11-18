@@ -130,6 +130,8 @@ final class LocalHTTPServer {
 
     private var listener: NWListener?
     private var serviceName = "LocalAPIBridge"
+    /// AI 多端点路由；由 PollingEngine 在启动时注入。
+    var router: EndpointRouter?
 
     init(
         store: BridgeStore,
@@ -248,7 +250,10 @@ final class LocalHTTPServer {
                 let receivedBodyLength = accumulated.count - separatorRange.upperBound
                 let expectedBodyLength = contentLength(in: headerData)
                 if receivedBodyLength >= expectedBodyLength {
-                    self.respond(headerData: headerData, on: connection)
+                    let bodyData = accumulated.subdata(
+                        in: separatorRange.upperBound..<accumulated.count
+                    )
+                    self.respond(headerData: headerData, bodyData: bodyData, on: connection)
                     return
                 }
                 if accumulated.count > 1_048_576 {
@@ -294,7 +299,7 @@ final class LocalHTTPServer {
         return 0
     }
 
-    private func respond(headerData: Data, on connection: NWConnection) {
+    private func respond(headerData: Data, bodyData: Data, on connection: NWConnection) {
         guard let headerText = String(data: headerData, encoding: .utf8) else {
             send(.json(status: 400, payload: ["ok": false, "error": "无法解析请求头"]), on: connection)
             return
@@ -327,7 +332,117 @@ final class LocalHTTPServer {
             }
         }
 
+        // 异步路由（AI 代理 / 路由状态）需要先做与同步路由相同的鉴权。
+        if let failure = authorizationFailure(headers: headers, target: target) {
+            send(failure, on: connection)
+            return
+        }
+
+        let parsed = parseTarget(target)
+        var path = parsed.path
+        if path.count > 1, path.hasSuffix("/") {
+            path.removeLast()
+        }
+        if path.isEmpty {
+            path = "/"
+        }
+
+        if method == "POST", path == "/v1/chat/completions" {
+            handleChatProxy(bodyData: bodyData, headers: headers, on: connection)
+            return
+        }
+        if method == "GET", path == "/v1/models" {
+            handleRouterQuery(kind: .models, on: connection)
+            return
+        }
+        if method == "GET", path == "/router/status" {
+            handleRouterQuery(kind: .status, on: connection)
+            return
+        }
+        if method == "GET", path == "/router/best" {
+            handleRouterQuery(kind: .best, on: connection)
+            return
+        }
+        if method == "POST", path == "/router/refresh" {
+            Task { @MainActor [weak self] in
+                self?.router?.probeAllNow()
+            }
+            send(.json(status: 202, payload: ["ok": true, "queued": true]), on: connection)
+            return
+        }
+
         send(route(method: method, target: target, headers: headers), on: connection)
+    }
+
+    private enum RouterQueryKind {
+        case models
+        case status
+        case best
+    }
+
+    private func handleChatProxy(
+        bodyData: Data,
+        headers: [String: String],
+        on connection: NWConnection
+    ) {
+        guard let router else {
+            send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let reply = await router.proxyChat(body: bodyData, incomingHeaders: headers)
+            let httpReply = HTTPReply.data(
+                status: reply.statusCode,
+                contentType: reply.contentType,
+                body: reply.body,
+                headers: reply.headers
+            )
+            self.send(httpReply, on: connection)
+        }
+    }
+
+    private func handleRouterQuery(kind: RouterQueryKind, on connection: NWConnection) {
+        guard let router else {
+            send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let reply: HTTPReply
+            switch kind {
+            case .models:
+                reply = .json(payload: router.modelsPayload())
+            case .status:
+                reply = .json(payload: router.statusPayload())
+            case .best:
+                if let payload = router.bestEndpointPayload() {
+                    reply = .json(payload: payload)
+                } else {
+                    reply = .json(status: 404, payload: ["ok": false, "error": "没有启用的 AI 端点"])
+                }
+            }
+            self.send(reply, on: connection)
+        }
+    }
+
+    /// 与 route 内部的 token 校验保持一致；通过返回 nil。
+    private func authorizationFailure(headers: [String: String], target: String) -> HTTPReply? {
+        let snapshot = store.read()
+        guard !snapshot.accessToken.isEmpty else { return nil }
+        let parsed = parseTarget(target)
+        var provided = headers["x-api-key"] ?? parsed.query["token"]
+        if let authorization = headers["authorization"], authorization.lowercased().hasPrefix("bearer ") {
+            provided = String(authorization.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard provided == snapshot.accessToken else {
+            return .json(status: 401, payload: [
+                "ok": false,
+                "error": "访问令牌缺失或不正确",
+                "hint": "使用请求头 X-API-Key: <token> 或查询参数 ?token=<token>"
+            ])
+        }
+        return nil
     }
 
     private func send(_ reply: HTTPReply, on connection: NWConnection) {
@@ -426,7 +541,12 @@ final class LocalHTTPServer {
             "GET /raw",
             "GET /json",
             "GET /history?limit=20",
-            "POST /refresh"
+            "POST /refresh",
+            "POST /v1/chat/completions",
+            "GET /v1/models",
+            "GET /router/status",
+            "GET /router/best",
+            "POST /router/refresh"
         ]
     }
 
