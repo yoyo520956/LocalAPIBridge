@@ -1,0 +1,75 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "LocalAPIBridge/**"
+      - "LocalAPIBridge.xcodeproj/**"
+      - "tools/**"
+      - ".github/workflows/build-ipa.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          python3 --version
+
+      - name: Generate app icon
+        run: python3 tools/make_icon.py
+
+      - name: Build app (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project LocalAPIBridge.xcodeproj \
+            -scheme LocalAPIBridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PRODUCT_BUNDLE_IDENTIFIER=com.yoyo520956.localapibridge \
+            build
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/LocalAPIBridge.app"
+          test -d "$APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry LocalAPIBridge-unsigned.ipa Payload
+          ls -lh LocalAPIBridge-unsigned.ipa
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalAPIBridge-unsigned-ipa
+          path: LocalAPIBridge-unsigned.ipa
+          retention-days: 14
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: LocalAPIBridge v1.0.0 (unsigned IPA)
+          body: |
+            iPhone 原生本地 API 轮询 / 局域网 HTTP 服务 / 画中画保活。
+
+            这是**未签名 IPA**：需要通过 AltStore、Sideloadly 或爱思助手，
+            用你自己的 Apple ID 重签后安装（免费账号 7 天有效）。
+          files: LocalAPIBridge-unsigned.ipa
+          overwrite_files: true
