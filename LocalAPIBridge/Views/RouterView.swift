@@ -522,8 +522,12 @@ private struct EndpointEditorView: View {
 
             Section {
                 NavigationLink {
-                    ModelImportView(baseURL: draft.trimmedBaseURL, apiKey: draft.apiKey)
-                        .environmentObject(router)
+                    ModelImportView(
+                        baseURL: draft.trimmedBaseURL,
+                        apiKey: draft.apiKey,
+                        onAdded: { dismiss() }
+                    )
+                    .environmentObject(router)
                 } label: {
                     Label("获取模型并批量添加", systemImage: "square.stack.3d.up")
                 }
@@ -563,6 +567,11 @@ private struct EndpointEditorView: View {
         .navigationTitle(isNew ? "添加端点" : "编辑端点")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("取消") {
+                    dismiss()
+                }
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button("保存") {
                     save()
@@ -602,9 +611,13 @@ private struct ModelImportView: View {
     @State private var isFetching = false
     @State private var errorMessage: String?
 
-    init(baseURL: String = "", apiKey: String = "") {
+    /// 从“添加/编辑端点”里进来时，用它把外层 sheet 一起关掉。
+    private let onAdded: (() -> Void)?
+
+    init(baseURL: String = "", apiKey: String = "", onAdded: (() -> Void)? = nil) {
         _baseURL = State(initialValue: baseURL)
         _apiKey = State(initialValue: apiKey)
+        self.onAdded = onAdded
     }
 
     var body: some View {
@@ -771,6 +784,10 @@ private struct ModelImportView: View {
             errorMessage = "这些模型已经有端点了，换一个 API 或先删掉旧的。"
             return
         }
-        dismiss()
+        if let onAdded {
+            onAdded()
+        } else {
+            dismiss()
+        }
     }
 }
