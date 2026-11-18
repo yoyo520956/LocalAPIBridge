@@ -55,6 +55,7 @@ final class PiPStatusController: NSObject, ObservableObject {
     private let statsViewController = PiPStatsViewController(nibName: nil, bundle: nil)
     private var timer: Timer?
     private var silentPlayer: AVAudioPlayer?
+    private var interruptionObserver: NSObjectProtocol?
     private let launchDate = Date()
 
     override init() {
@@ -81,11 +82,13 @@ final class PiPStatusController: NSObject, ObservableObject {
     func attach(sourceView: UIView, statusProvider: @escaping () -> PiPStatusData) {
         if self.sourceView !== sourceView {
             self.sourceView = sourceView
-            pipController?.stopPictureInPicture()
-            pipController = nil
-            possibleObservation = nil
-            isPossible = false
-            isActive = false
+            if pipController?.isPictureInPictureActive != true {
+                pipController?.stopPictureInPicture()
+                pipController = nil
+                possibleObservation = nil
+                isPossible = false
+                isActive = false
+            }
         }
         self.statusProvider = statusProvider
         refreshContent()
@@ -107,23 +110,38 @@ final class PiPStatusController: NSObject, ObservableObject {
             lastError = "请先打开画中画保活开关"
             return
         }
+        if silentPlayer == nil { activateAudio() }
         buildControllerIfNeeded()
         guard let controller = pipController else {
             lastError = "画中画尚未就绪"
             return
         }
-        guard controller.isPictureInPicturePossible else {
-            lastError = "画中画暂时不可用，请回到前台稍后再试"
+        if controller.isPictureInPicturePossible {
+            if !controller.isPictureInPictureActive {
+                controller.startPictureInPicture()
+            }
             return
         }
-        if !controller.isPictureInPictureActive {
-            controller.startPictureInPicture()
+
+        // 刚打开开关时 possible 需要几帧才变 true，稍等后重试一次。
+        lastError = nil
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard self.isEnabled, let controller = self.pipController else { return }
+            if controller.isPictureInPicturePossible {
+                if !controller.isPictureInPictureActive {
+                    controller.startPictureInPicture()
+                }
+            } else {
+                self.lastError = "画中画暂时不可用，请回到前台稍后再试"
+            }
         }
     }
 
     /// App 进入后台时再兜底尝试一次；正常情况下由自动画中画接管。
     func startIfPossible() {
         guard isEnabled, let controller = pipController else { return }
+        if silentPlayer == nil { activateAudio() }
         refreshContent()
         if controller.isPictureInPicturePossible, !controller.isPictureInPictureActive {
             controller.startPictureInPicture()
@@ -141,6 +159,7 @@ final class PiPStatusController: NSObject, ObservableObject {
         }
         isEnabled = true
         activateAudio()
+        registerInterruptionObserver()
         startTimer()
         refreshContent()
         buildControllerIfNeeded()
@@ -155,6 +174,12 @@ final class PiPStatusController: NSObject, ObservableObject {
         timer = nil
         silentPlayer?.stop()
         silentPlayer = nil
+        if let observer = interruptionObserver {
+            NotificationCenter.default.removeObserver(observer)
+            interruptionObserver = nil
+        }
+        possibleObservation = nil
+        isPossible = false
     }
 
     private func buildControllerIfNeeded() {
@@ -192,12 +217,44 @@ final class PiPStatusController: NSObject, ObservableObject {
         try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
         try? session.setActive(true)
 
-        guard silentPlayer == nil, let url = try? SilentAudio.fileURL() else { return }
-        let player = try? AVAudioPlayer(contentsOf: url)
-        player?.numberOfLoops = -1
-        player?.volume = 0.02
-        player?.play()
-        silentPlayer = player
+        guard silentPlayer == nil else { return }
+        guard let url = try? SilentAudio.fileURL(),
+              let player = try? AVAudioPlayer(contentsOf: url) else {
+            lastError = "无法创建静音播放器"
+            return
+        }
+        player.numberOfLoops = -1
+        player.volume = 0.02
+        if player.play() {
+            silentPlayer = player
+        } else {
+            silentPlayer = nil
+            lastError = "静音播放器启动失败"
+        }
+    }
+
+    private func registerInterruptionObserver() {
+        guard interruptionObserver == nil else { return }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            guard let rawValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: rawValue) else {
+                return
+            }
+            if type == .ended {
+                Task { @MainActor in
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    if self.silentPlayer?.play() != true {
+                        self.silentPlayer = nil
+                        self.activateAudio()
+                    }
+                }
+            }
+        }
     }
 
     private func startTimer() {
@@ -281,6 +338,7 @@ extension PiPStatusController: AVPictureInPictureControllerDelegate {
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         isActive = true
+        lastError = nil
     }
 
     func pictureInPictureController(
@@ -293,6 +351,12 @@ extension PiPStatusController: AVPictureInPictureControllerDelegate {
 
     func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         isActive = false
+        lastError = nil
+        if isEnabled {
+            pipController = nil
+            possibleObservation = nil
+            buildControllerIfNeeded()
+        }
     }
 
     func pictureInPictureController(

@@ -525,8 +525,9 @@ final class PollingEngine: ObservableObject {
         let modelName: String
         if !configuredName.isEmpty {
             modelName = configuredName
-        } else if let recordName = successfulRecord?.modelName, !recordName.isEmpty {
-            modelName = recordName
+        } else if let recordName = successfulRecord?.modelName {
+            let trimmed = recordName.trimmingCharacters(in: .whitespacesAndNewlines)
+            modelName = trimmed.isEmpty ? "未识别" : trimmed
         } else {
             modelName = "未识别"
         }
