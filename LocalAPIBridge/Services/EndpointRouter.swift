@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// 代理请求返回的完整响应。
@@ -33,6 +34,7 @@ struct RouterPiPInfo {
 
 private enum ProbeOutcome: Sendable {
     case healthy(Int)
+    case cancelled
     case auth(String)
     case unsupported(String)
     case failure(String)
@@ -71,7 +73,7 @@ final class EndpointRouter: ObservableObject {
     private let maximumLogCount = 200
 
     init() {
-        configuration = RouterConfigurationStore.load()
+        configuration = RouterConfigurationStore.load().sanitized
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.timeoutIntervalForRequest = 30
         sessionConfiguration.timeoutIntervalForResource = 90
@@ -340,6 +342,8 @@ final class EndpointRouter: ObservableObject {
     }
 
     func probeAll() async {
+        // 避免监控循环、保存设置、手动探测同时跑，互相覆盖健康值。
+        guard !isProbing else { return }
         let endpoints = configuration.endpoints.filter { $0.enabled }
         guard !endpoints.isEmpty else {
             isProbing = false
@@ -377,20 +381,28 @@ final class EndpointRouter: ObservableObject {
         var item = health[endpointID] ?? .unknown(endpointID)
         item.lastChecked = Date()
         switch outcome {
+        case .cancelled:
+            // 被取消的探测不算失败，也不改任何健康状态。
+            return
         case .healthy(let latency):
-            item.state = .healthy
-            // 探测延迟只做参考：和最近一次真实对话延迟各占一半，
-            // 避免“/models 很快但出字很慢”的端点被排到前面。
+            let wasCooling = item.state == .cooling
+            if !wasCooling {
+                item.state = .healthy
+            }
+            // 探测延迟只做微调（15%），主要保留真实对话延迟——客户端是非流式的，
+            // “答得快不快”取决于整段回答耗时，而不是 /models 的 RTT。
             if let previous = item.latencyMilliseconds {
-                item.latencyMilliseconds = Int(Double(previous) * 0.5 + Double(latency) * 0.5)
+                item.latencyMilliseconds = Int(Double(previous) * 0.85 + Double(latency) * 0.15)
             } else {
                 item.latencyMilliseconds = latency
             }
             item.successCount += 1
-            item.consecutiveFailures = 0
+            if !wasCooling {
+                item.consecutiveFailures = 0
+                item.lastError = nil
+                item.cooldownUntil = nil
+            }
             item.lastSuccess = Date()
-            item.lastError = nil
-            item.cooldownUntil = nil
         case .auth(let message):
             item.state = .cooling
             item.consecutiveFailures += 1
@@ -398,9 +410,8 @@ final class EndpointRouter: ObservableObject {
             item.lastError = message
             item.cooldownUntil = Date().addingTimeInterval(600)
         case .unsupported(let message):
-            item.state = .degraded
+            // 很多免费中转站没有 /models；这不代表不能聊天，保持原状态。
             item.lastError = message
-            item.cooldownUntil = nil
         case .failure(let message):
             item.failureCount += 1
             item.consecutiveFailures += 1
@@ -780,7 +791,17 @@ final class EndpointRouter: ObservableObject {
         } else {
             suffix = "/" + rawPath
         }
-        guard let url = URL(string: base + suffix) else {
+        guard var components = URLComponents(string: base) else {
+            return ModelDiscoveryResult(models: [], error: "模型列表地址无效", suggestedName: suggestedName)
+        }
+        var basePath = components.path
+        while basePath.hasSuffix("/") {
+            basePath.removeLast()
+        }
+        components.path = basePath + suffix
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url else {
             return ModelDiscoveryResult(models: [], error: "模型列表地址无效", suggestedName: suggestedName)
         }
 
@@ -909,6 +930,9 @@ final class EndpointRouter: ObservableObject {
                 return .failure("HTTP \(http.statusCode)")
             }
         } catch {
+            if Task.isCancelled || (error as NSError).code == NSURLErrorCancelled {
+                return .cancelled
+            }
             return .failure(error.localizedDescription)
         }
     }
