@@ -98,8 +98,8 @@ final class EndpointRouter: ObservableObject {
             startMonitoring()
         } else {
             stopMonitoring()
+            probeAllNow()
         }
-        probeAllNow()
     }
 
     func setMonitoringEnabled(_ enabled: Bool) {
