@@ -151,7 +151,7 @@ struct RouterView: View {
         } header: {
             Text("当前最优")
         } footer: {
-            Text("路由会先选健康排名第一的端点；如果它在 \(router.configuration.hedgeDelayMilliseconds) ms 内没有返回，就并发启动后续端点，先成功者胜出。健康探测默认每 \(Int(router.configuration.probeIntervalSeconds)) 秒一次。")
+            Text("路由会先选健康排名第一的端点；如果它在 \(router.configuration.hedgeDelayMilliseconds) ms 内没有返回，就并发启动后续端点。非流式请求先答完者胜出；流式请求（stream:true）先吐出第一行者胜出，并立刻取消其余上游。健康探测默认每 \(Int(router.configuration.probeIntervalSeconds)) 秒一次。")
         }
     }
 
