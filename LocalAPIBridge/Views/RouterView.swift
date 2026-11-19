@@ -14,6 +14,8 @@ struct RouterView: View {
     @State private var contextLimit = 128_000
     @State private var displayModel = ""
     @State private var monitoring = true
+    @State private var exposeAllModels = true
+    @State private var firstByteHedge = 600
     @State private var showEditor = false
     @State private var showModelImport = false
     @State private var editingEndpoint: AIEndpoint?
@@ -281,6 +283,17 @@ struct RouterView: View {
                 }
             }
 
+            Stepper(value: $firstByteHedge, in: 0...5_000, step: 100) {
+                HStack {
+                    Text("慢端点提前并发")
+                    Spacer()
+                    Text("\(firstByteHedge) ms")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Toggle("对外列出真实模型名", isOn: $exposeAllModels)
+
             Stepper(value: $maxRace, in: 1...5, step: 1) {
                 HStack {
                     Text("最多并发端点")
@@ -311,7 +324,7 @@ struct RouterView: View {
         } header: {
             Text("路由参数")
         } footer: {
-            Text("选路本身是本地健康排名，0 网络等待；默认 0.1 秒内首端点没返回就并发下一个，先成功者胜出。0.1 秒指的是“锁定并开打”的时间，不是模型完整回答的时间。")
+            Text("选路本身是本地健康排名，0 网络等待；默认 0.1 秒内首端点没返回就并发下一个。若首选端点上次首字节超过上面的“慢端点提前并发”（默认 600ms），则直接同时并发，不再等。\n“对外列出真实模型名”会让 Cherry Studio / Open WebUI 这类客户端认出具体模型，从而允许图片上传和工具调用；只列 auto 时它们会当成未知模型。")
         }
     }
 
@@ -397,6 +410,8 @@ struct RouterView: View {
         contextLimit = router.configuration.contextLimitTokens
         displayModel = router.configuration.displayModelName
         monitoring = router.configuration.monitoringEnabled
+        exposeAllModels = router.configuration.exposeAllModels
+        firstByteHedge = router.configuration.firstByteHedgeMilliseconds
     }
 
     private func saveSettings() {
@@ -408,6 +423,8 @@ struct RouterView: View {
         config.contextLimitTokens = contextLimit
         config.displayModelName = displayModel
         config.monitoringEnabled = monitoring
+        config.exposeAllModels = exposeAllModels
+        config.firstByteHedgeMilliseconds = firstByteHedge
         router.apply(config)
         alertTitle = "已保存"
         alertMessage = "路由参数已生效，并已重新探测。"

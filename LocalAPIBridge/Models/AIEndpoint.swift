@@ -201,7 +201,7 @@ struct RouteLog: Identifiable, Codable, Equatable {
 }
 
 struct RouterConfiguration: Codable, Equatable {
-    /// 客户端 /v1/models 只暴露这一个模型标识，由路由自动挑真实端点。
+    /// 路由用的“自动”标识。
     static let autoModelID = "auto"
 
     var endpoints: [AIEndpoint]
@@ -213,6 +213,24 @@ struct RouterConfiguration: Codable, Equatable {
     var contextLimitTokens: Int
     var displayModelName: String
     var monitoringEnabled: Bool
+    /// /v1/models 是否连带暴露端点的真实模型名（客户端据此启用图片/工具等能力）。
+    var exposeAllModels: Bool
+    /// 空闲多久后仍没有首字节就并发下一个端点；流式场景用它兜底慢上游。
+    var firstByteHedgeMilliseconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case endpoints
+        case subscriptions
+        case probeIntervalSeconds
+        case probeTimeoutSeconds
+        case hedgeDelayMilliseconds
+        case maxRaceEndpoints
+        case contextLimitTokens
+        case displayModelName
+        case monitoringEnabled
+        case exposeAllModels
+        case firstByteHedgeMilliseconds
+    }
 
     init() {
         endpoints = []
@@ -224,6 +242,24 @@ struct RouterConfiguration: Codable, Equatable {
         contextLimitTokens = 128_000
         displayModelName = ""
         monitoringEnabled = true
+        exposeAllModels = true
+        firstByteHedgeMilliseconds = 600
+    }
+
+    /// 容错解码：老版本存下来的 JSON 缺字段时用默认值，避免升级后端点被清空。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        endpoints = (try? container.decodeIfPresent([AIEndpoint].self, forKey: .endpoints)) ?? []
+        subscriptions = (try? container.decodeIfPresent([EndpointSubscription].self, forKey: .subscriptions)) ?? []
+        probeIntervalSeconds = (try? container.decodeIfPresent(Double.self, forKey: .probeIntervalSeconds)) ?? 30
+        probeTimeoutSeconds = (try? container.decodeIfPresent(Double.self, forKey: .probeTimeoutSeconds)) ?? 2
+        hedgeDelayMilliseconds = (try? container.decodeIfPresent(Int.self, forKey: .hedgeDelayMilliseconds)) ?? 100
+        maxRaceEndpoints = (try? container.decodeIfPresent(Int.self, forKey: .maxRaceEndpoints)) ?? 3
+        contextLimitTokens = (try? container.decodeIfPresent(Int.self, forKey: .contextLimitTokens)) ?? 128_000
+        displayModelName = (try? container.decodeIfPresent(String.self, forKey: .displayModelName)) ?? ""
+        monitoringEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .monitoringEnabled)) ?? true
+        exposeAllModels = (try? container.decodeIfPresent(Bool.self, forKey: .exposeAllModels)) ?? true
+        firstByteHedgeMilliseconds = (try? container.decodeIfPresent(Int.self, forKey: .firstByteHedgeMilliseconds)) ?? 600
     }
 
     var sanitized: RouterConfiguration {
@@ -235,6 +271,7 @@ struct RouterConfiguration: Codable, Equatable {
             ? min(max(probeTimeoutSeconds, 0.5), 30)
             : 2
         copy.hedgeDelayMilliseconds = min(max(hedgeDelayMilliseconds, 20), 2_000)
+        copy.firstByteHedgeMilliseconds = min(max(firstByteHedgeMilliseconds, 0), 10_000)
         copy.maxRaceEndpoints = min(max(maxRaceEndpoints, 1), 5)
         copy.contextLimitTokens = min(max(contextLimitTokens, 100), 10_000_000)
         copy.displayModelName = displayModelName.trimmingCharacters(in: .whitespacesAndNewlines)
