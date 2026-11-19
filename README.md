@@ -317,12 +317,13 @@ AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/v1/chat/completions` | 代理到当前最优端点；`stream:true` 走 **SSE 流式透传**，`stream:false` 返回完整 JSON |
-| GET | `/v1/models` | **只返回一个模型 `auto`**，真实模型由路由在后台自动挑 |
+| GET | `/v1/models` | 返回 `auto` + 端点的真实模型名（可在“路由参数”里关掉，只留 auto） |
+| GET | `/v1/models/{id}` | 单个模型详情 |
 | GET | `/router/status` | 所有端点健康状态、延迟、排名、统计 |
 | GET | `/router/best` | 当前最优端点信息（不返回 API Key） |
 | POST | `/router/refresh` | 立即重新探测所有端点 |
 
-> 客户端里模型列表会只显示一个 **auto（自动）**；点刷新也还是这一个。这是故意的：你加了多少个模型、多少个订阅都不用改客户端，路由自己换。
+> 模型列表里有 **auto（自动）** 和端点的真实模型名。`auto` 永远可用；真实模型名是为了让客户端认出“这是什么模型”——很多客户端（Cherry Studio、Open WebUI 等）只认得具体模型名，看到未知的 `auto` 就会把**图片上传、工具调用禁用**，甚至提示“该模型不可用”。如果你只想保留一个 `auto`，把“对外列出真实模型名”关掉即可。
 
 **在任何 OpenAI 兼容客户端里只要填三个字段（Cherry Studio / Chatbox / OpenWebUI / LobeChat / Continue / 各种"AI 聚合助手"都适用）：**
 
@@ -330,7 +331,7 @@ AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启
 |---|---|
 | API 地址 / Base URL | 手机上的 App 自己用：`http://127.0.0.1:8787/v1`<br>同一 Wi-Fi 的电脑/平板：`http://<iPhone 的 IP>:8787/v1`（IP 在 App 首页能看到） |
 | API Key | 随便填，例如 `sk-local`（除非你在设置里开了"访问令牌"，那就填那个令牌） |
-| 模型 | 选 `auto`（列表里只有这一个，刷新也一样） |
+| 模型 | `auto`，或列表里的真实模型名（效果一样，路由都会换成端点的真实模型） |
 
 填完直接对话即可：路由会在你添加的所有端点里自动挑当时最快、可用的那个，客户端完全不用改。
 
@@ -365,7 +366,25 @@ curl -N -X POST "http://127.0.0.1:8787/v1/chat/completions" \
 - 返回的是上游原始响应体，Content-Type 原样带回；
 - 如果所有端点都失败，返回 JSON 错误（503），并带最后一次失败信息。
 
-### 6.6 画中画显示
+### 6.6 客户端兼容清单（“模型用不了 / 不能传图片”多半是这里）
+
+| 客户端 | 地址怎么填 | 模型怎么选 | 说明 |
+|---|---|---|---|
+| Cherry Studio | 设置 → 模型服务 → OpenAI → API 地址 `http://<IP>:8787/v1` | `auto` 或列表里的真实模型名 | 只列 `auto` 时它把模型当“未知”，会禁用图片上传；现在列出真实模型名即可正常传图 |
+| Chatbox | 设置 → OpenAI API → API Host `http://<IP>:8787/v1` | `auto` | 默认开流式，已支持 |
+| Open WebUI | 设置 → 连接 → OpenAI → URL `http://<IP>:8787/v1`，Key 随意 | 拉到 `auto` + 真实模型 | 想用图片就在该模型的“视觉”开关里打开 |
+| NextChat / LobeChat | 自定义接口，地址 `http://<IP>:8787`（会自己补 `/v1`） | `auto` | 服务端已兼容 `/v1/v1/...`，多写一段也不会 404 |
+| 沉浸式翻译 / 浏览器插件 | 自定义 OpenAI，地址 `http://<IP>:8787/v1` | `auto` | 需要允许 HTTP 明文请求 |
+| Python / Node SDK | `base_url="http://<IP>:8787/v1"` | `model="auto"` | `stream=True` 可用 |
+| 只能选内置模型的客户端（如只让选 `gpt-4o`） | 同上 | 选它内置的任意模型 | 路由会把请求里的 `model` 换成端点真实模型，所以照样能用 |
+
+三个常见坑：
+
+1. **客户端必须允许 HTTP 明文**（ATS 例外）。iOS 上的客户端访问 `http://` 局域网地址，如果没有这个例外会直接连不上——这不是服务端的问题。
+2. **手机和客户端要在同一个 Wi-Fi**，且路由器没开 AP 隔离（很多酒店的 Wi-Fi 会隔离设备）。
+3. **iPhone 上 App 被系统挂起**时服务会停：用画中画 + 静音音频保活，并在客户端里把超时调大一点（30–60 秒）。
+
+### 6.7 画中画显示
 
 配置了 AI 多端点后，画中画浮窗的“模型 / 上下文”优先使用 AI 路由的当前最优端点与最近一次代理响应里的 token 用量；没配置端点时回退到原来的单接口轮询记录。
 
@@ -568,7 +587,7 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
-当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `1a40044`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒首字节竞速、**SSE 流式透传**、探测状态机加固、CORS 预检修复、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有流式实现的字符串（`text/event-stream`、`Transfer-Encoding: chunked`、`event: error`）和“一键全选并添加全部”，并已通过 Release 下载校验。
+当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `5839505`，版本 **1.1 build 2**：包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 返回 `auto` + 真实模型名、按请求模型名选路、0.1 秒首字节竞速、**SSE 流式透传**、chunked 请求体与 HEAD 兼容、探测状态机加固、CORS 预检修复、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有流式实现的字符串（`text/event-stream`、`Transfer-Encoding: chunked`、`event: error`）和“一键全选并添加全部”，并已通过 Release 下载校验。
 
 ### 13.1 下载
 
@@ -591,14 +610,14 @@ https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/downloa
 SHA256：
 
 ```
-c955451f57211f6dec68b149a7f46927ce99ab5144e8b0d7ef1490205fedb8e6
+f83043f3f03ed1b2d427b119a1587dabffbd4ed93f0c18a99f9a3a544b8ad2c5
 ```
 
-文件大小：`953584` 字节（约 931 KB）。
+文件大小：`965959` 字节（约 943 KB，版本 1.1 build 2）。
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
 >
-> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）、926422、950718、950992、951795 等几个中间版本；只要大小不是 `953584` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
+> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）、926422、950718、950992、951795 等几个中间版本；只要大小不是 `965959` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
 
 ### 13.2 为什么是“未签名”IPA？
 
