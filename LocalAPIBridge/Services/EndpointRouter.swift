@@ -104,7 +104,7 @@ final class EndpointRouter: ObservableObject {
         configuration = RouterConfigurationStore.load().sanitized
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.timeoutIntervalForRequest = 30
-        sessionConfiguration.timeoutIntervalForResource = 90
+        sessionConfiguration.timeoutIntervalForResource = 180
         sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
         sessionConfiguration.httpAdditionalHeaders = ["User-Agent": "LocalAPIBridge-Router/1.0 (iOS)"]
         session = URLSession(configuration: sessionConfiguration)
@@ -112,8 +112,8 @@ final class EndpointRouter: ObservableObject {
         // 流式请求单独一套会话：模型可能连续输出几分钟，
         // 不能被 90 秒的资源超时打断。
         let streamingConfiguration = URLSessionConfiguration.ephemeral
-        streamingConfiguration.timeoutIntervalForRequest = 60
-        streamingConfiguration.timeoutIntervalForResource = 900
+        streamingConfiguration.timeoutIntervalForRequest = 300
+        streamingConfiguration.timeoutIntervalForResource = 1_800
         streamingConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
         streamingConfiguration.httpAdditionalHeaders = ["User-Agent": "LocalAPIBridge-Router/1.0 (iOS)"]
         streamingSession = URLSession(configuration: streamingConfiguration)
@@ -606,7 +606,6 @@ final class EndpointRouter: ObservableObject {
 
         let race = StreamRace()
         var winner: AIEndpoint?
-        var winnerLatency = 0
         var failures: [(AIEndpoint, String, Int, Int)] = []
 
         await withTaskGroup(of: StreamOutcome.self) { group in
@@ -631,7 +630,10 @@ final class EndpointRouter: ObservableObject {
                 switch outcome {
                 case .won(let endpoint, let latency):
                     winner = endpoint
-                    winnerLatency = latency
+                    // 赢家已经结束、之后不可能再有 chunk，可以立刻告诉服务端收尾，
+                    // 不用等落败的并发请求被取消回收。
+                    recordStreamSuccess(endpoint: endpoint, latency: max(latency, 0))
+                    continuation.yield(.finished)
                     group.cancelAll()
                 case .failed(let endpoint, let message, let latency, let statusCode):
                     failures.append((endpoint, message, latency, statusCode))
@@ -642,10 +644,7 @@ final class EndpointRouter: ObservableObject {
             }
         }
 
-        if let winner {
-            recordStreamSuccess(endpoint: winner, latency: max(winnerLatency, 0))
-            continuation.yield(.finished)
-        } else {
+        if winner == nil {
             for failure in failures {
                 recordFailure(
                     endpoint: failure.0,
@@ -721,7 +720,21 @@ final class EndpointRouter: ObservableObject {
                 let didClaim = await race.claim()
                 guard didClaim else { return .lost }
                 let latency = Int(Date().timeIntervalSince(startedAt) * 1000)
-                let compact = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                var compact = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let raw = compact.data(using: .utf8),
+                   let object = try? JSONSerialization.jsonObject(with: raw, options: [.fragmentsAllowed]),
+                   let compactData = try? JSONSerialization.data(
+                       withJSONObject: object,
+                       options: [.withoutEscapingSlashes, .fragmentsAllowed]
+                   ),
+                   let text = String(data: compactData, encoding: .utf8) {
+                    compact = text
+                } else {
+                    // 不是 JSON 时也要保证 SSE 的 data 只有一行
+                    compact = compact
+                        .replacingOccurrences(of: "\r", with: " ")
+                        .replacingOccurrences(of: "\n", with: " ")
+                }
                 continuation.yield(.head(contentType: "text/event-stream; charset=utf-8"))
                 continuation.yield(.chunk(Data("data: \(compact)\n\n".utf8)))
                 continuation.yield(.chunk(Data("data: [DONE]\n\n".utf8)))
@@ -1220,7 +1233,7 @@ final class EndpointRouter: ObservableObject {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 45
+        request.timeoutInterval = 120
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         Self.applyAuth(to: &request, endpoint: endpoint, incomingHeaders: incomingHeaders)
