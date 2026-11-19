@@ -249,6 +249,29 @@ final class LocalHTTPServer {
 
             if let separatorRange = accumulated.range(of: Data("\r\n\r\n".utf8)) {
                 let headerData = accumulated.subdata(in: 0..<separatorRange.lowerBound)
+                if self.headerIsChunked(headerData) {
+                    let rawBody = accumulated.subdata(in: separatorRange.upperBound..<accumulated.count)
+                    if let decoded = self.decodeChunkedBody(rawBody) {
+                        self.respond(headerData: headerData, bodyData: decoded, on: connection)
+                        return
+                    }
+                    if accumulated.count > 8_388_608 {
+                        self.send(
+                            HTTPReply.json(status: 413, payload: ["ok": false, "error": "请求体过大"]),
+                            on: connection
+                        )
+                        return
+                    }
+                    if isComplete || error != nil {
+                        self.send(
+                            HTTPReply.json(status: 400, payload: ["ok": false, "error": "chunked 请求体不完整"]),
+                            on: connection
+                        )
+                        return
+                    }
+                    self.receive(on: connection, buffer: accumulated)
+                    return
+                }
                 let receivedBodyLength = accumulated.count - separatorRange.upperBound
                 let expectedBodyLength = contentLength(in: headerData)
                 if receivedBodyLength >= expectedBodyLength {
@@ -301,6 +324,41 @@ final class LocalHTTPServer {
         return 0
     }
 
+    private func headerIsChunked(_ headerData: Data) -> Bool {
+        guard let text = String(data: headerData, encoding: .utf8) else { return false }
+        return text.lowercased().contains("transfer-encoding: chunked")
+    }
+
+    /// 解码 `Transfer-Encoding: chunked` 的请求体；数据不完整时返回 nil。
+    private func decodeChunkedBody(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        var result = Data()
+        var index = data.startIndex
+        while true {
+            guard let lineEnd = data.range(of: Data("\r\n".utf8), in: index..<data.endIndex) else {
+                return nil
+            }
+            let sizeLine = String(decoding: data[index..<lineEnd.lowerBound], as: UTF8.self)
+            let hexPart = sizeLine.split(separator: ";").first.map(String.init) ?? ""
+            guard let size = Int(hexPart.trimmingCharacters(in: .whitespaces), radix: 16), size >= 0 else {
+                return nil
+            }
+            var cursor = lineEnd.upperBound
+            if size == 0 {
+                return result
+            }
+            guard let chunkEnd = data.index(cursor, offsetBy: size, limitedBy: data.endIndex) else {
+                return nil
+            }
+            guard let nextStart = data.index(chunkEnd, offsetBy: 2, limitedBy: data.endIndex) else {
+                return nil
+            }
+            result.append(data[cursor..<chunkEnd])
+            index = nextStart
+            cursor = nextStart
+        }
+    }
+
     private func respond(headerData: Data, bodyData: Data, on connection: NWConnection) {
         guard let headerText = String(data: headerData, encoding: .utf8) else {
             send(.json(status: 400, payload: ["ok": false, "error": "无法解析请求头"]), on: connection)
@@ -335,6 +393,11 @@ final class LocalHTTPServer {
         }
 
         // 异步路由（AI 代理 / 路由状态）需要先做与同步路由相同的鉴权。
+        if method == "HEAD" {
+            send(.empty(status: 200), on: connection)
+            return
+        }
+
         if method != "OPTIONS", let failure = authorizationFailure(headers: headers, target: target) {
             send(failure, on: connection)
             return
@@ -355,6 +418,11 @@ final class LocalHTTPServer {
 
         if method == "POST", path == "/v1/chat/completions" {
             handleChatProxy(bodyData: bodyData, headers: headers, on: connection)
+            return
+        }
+        if method == "GET", path.hasPrefix("/v1/models/") {
+            let modelID = String(path.dropFirst("/v1/models/".count))
+            handleModelDetail(modelID: modelID, on: connection)
             return
         }
         if method == "GET", path == "/v1/models" {
@@ -395,7 +463,10 @@ final class LocalHTTPServer {
             send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
             return
         }
-        if Self.wantsStreaming(bodyData) {
+        // 有些客户端只在请求头里声明要 SSE（body 里 stream 仍是 false），
+        // 以前会被当成非流式处理，于是客户端一直等不到流。
+        let acceptsEventStream = (headers["accept"] ?? "").lowercased().contains("text/event-stream")
+        if Self.wantsStreaming(bodyData) || acceptsEventStream {
             handleStreamingChat(router: router, bodyData: bodyData, headers: headers, on: connection)
             return
         }
@@ -554,6 +625,23 @@ final class LocalHTTPServer {
                 )
             }
         )
+    }
+
+    private func handleModelDetail(modelID: String, on connection: NWConnection) {
+        guard let router else {
+            send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
+            return
+        }
+        Task { @MainActor in
+            if let payload = router.modelDetailPayload(id: modelID) {
+                self.send(.json(payload: payload), on: connection)
+            } else {
+                self.send(
+                    .json(status: 404, payload: ["ok": false, "error": "模型不存在"]),
+                    on: connection
+                )
+            }
+        }
     }
 
     private func handleRouterQuery(kind: RouterQueryKind, on connection: NWConnection) {
