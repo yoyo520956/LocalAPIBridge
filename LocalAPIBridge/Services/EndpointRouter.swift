@@ -490,6 +490,28 @@ final class EndpointRouter: ObservableObject {
         }
     }
 
+    /// 客户端指定了具体模型名时，优先用同名端点；没有同名再退回全局排名。
+    func rankedEndpoints(preferring model: String?) -> [AIEndpoint] {
+        let base = rankedEndpoints()
+        guard let raw = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              raw.caseInsensitiveCompare(RouterConfiguration.autoModelID) != .orderedSame else {
+            return base
+        }
+        let wanted = raw.lowercased()
+        let exact = base.filter { $0.model.lowercased() == wanted }
+        let fuzzy = base.filter {
+            $0.model.lowercased().contains(wanted) && $0.model.lowercased() != wanted
+        }
+        guard !exact.isEmpty || !fuzzy.isEmpty else { return base }
+        var result = exact
+        result.append(contentsOf: fuzzy)
+        for endpoint in base where !result.contains(endpoint) {
+            result.append(endpoint)
+        }
+        return result
+    }
+
     func bestEndpoint() -> AIEndpoint? {
         rankedEndpoints().first
     }
@@ -515,7 +537,10 @@ final class EndpointRouter: ObservableObject {
     // MARK: - 代理聊天
 
     func proxyChat(body: Data, incomingHeaders: [String: String]) async -> AIProxyReply {
-        let candidates = Array(rankedEndpoints().prefix(configuration.maxRaceEndpoints))
+        let preferred = Self.requestedModel(in: body)
+        let candidates = Array(
+            rankedEndpoints(preferring: preferred).prefix(configuration.maxRaceEndpoints)
+        )
         guard !candidates.isEmpty else {
             return .error("没有启用的 AI 端点")
         }
@@ -570,8 +595,15 @@ final class EndpointRouter: ObservableObject {
 
     /// 客户端要 stream=true 时走这里：边收边发，谁先吐出第一行就锁谁。
     func streamChat(body: Data, incomingHeaders: [String: String]) -> AsyncStream<StreamEvent> {
-        let candidates = Array(rankedEndpoints().prefix(max(configuration.maxRaceEndpoints, 1)))
-        let hedgeMilliseconds = configuration.hedgeDelayMilliseconds
+        let preferred = Self.requestedModel(in: body)
+        let candidates = Array(
+            rankedEndpoints(preferring: preferred).prefix(max(configuration.maxRaceEndpoints, 1))
+        )
+        // 首选端点历史上首字节就很慢时，直接同时并发，不再等 hedge 时间。
+        let topLatency = candidates.first.flatMap { health[$0.id]?.latencyMilliseconds } ?? 0
+        let hedgeMilliseconds = topLatency > configuration.firstByteHedgeMilliseconds
+            ? 0
+            : configuration.hedgeDelayMilliseconds
         let streamSession = streamingSession
         return AsyncStream { continuation in
             let task = Task { @MainActor in
@@ -891,13 +923,70 @@ final class EndpointRouter: ObservableObject {
 
     /// 客户端只看到一个模型标识：`auto`（自动选路）。
     func modelsPayload() -> [String: Any] {
-        let item: [String: Any] = [
-            "id": RouterConfiguration.autoModelID,
+        var items: [[String: Any]] = [Self.modelObject(id: RouterConfiguration.autoModelID)]
+        var seen: Set<String> = [RouterConfiguration.autoModelID]
+
+        if configuration.exposeAllModels {
+            for endpoint in configuration.endpoints where endpoint.enabled {
+                let id = endpoint.displayModel
+                let key = id.lowercased()
+                guard !key.isEmpty, !seen.contains(key) else { continue }
+                seen.insert(key)
+                items.append(Self.modelObject(id: id))
+            }
+        }
+        return ["object": "list", "data": items]
+    }
+
+    /// 客户端（Cherry Studio / Open WebUI / Chatbox 等）会按模型名判断能力：
+    /// 只给一个 "auto" 时它们会认为“未知模型”，于是图片上传被禁用、甚至拒绝发送。
+    /// 这里把真实模型名也列出来，并附带能力提示（非标准字段，客户端会忽略）。
+    nonisolated static func modelObject(id: String, ownedBy: String = "localapibridge") -> [String: Any] {
+        [
+            "id": id,
             "object": "model",
             "created": 1_767_225_600,
-            "owned_by": "localapibridge"
+            "owned_by": ownedBy,
+            "capabilities": [
+                "vision": looksVisionCapable(id),
+                "tools": true
+            ]
         ]
-        return ["object": "list", "data": [item]]
+    }
+
+    nonisolated static func looksVisionCapable(_ model: String) -> Bool {
+        let lower = model.lowercased()
+        let hints = [
+            "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "vision", "omni",
+            "claude-3", "claude-4", "claude-sonnet", "claude-opus",
+            "gemini", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "glm-4v",
+            "llava", "pixtral", "internvl", "minicpm-v", "gpt-4-vision"
+        ]
+        return hints.contains { lower.contains($0) }
+    }
+
+    /// 从请求体里取客户端想要的模型名（可能是 auto、真实模型名或别名）。
+    nonisolated static func requestedModel(in body: Data) -> String? {
+        guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              let raw = object["model"] as? String else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func modelDetailPayload(id: String) -> [String: Any]? {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.caseInsensitiveCompare(RouterConfiguration.autoModelID) == .orderedSame {
+            return Self.modelObject(id: RouterConfiguration.autoModelID)
+        }
+        for endpoint in configuration.endpoints where endpoint.enabled {
+            if endpoint.displayModel.caseInsensitiveCompare(trimmed) == .orderedSame {
+                return Self.modelObject(id: endpoint.displayModel)
+            }
+        }
+        return nil
     }
 
     func statusPayload() -> [String: Any] {
