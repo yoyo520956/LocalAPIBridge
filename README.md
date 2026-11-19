@@ -231,6 +231,29 @@ print(String(decoding: data, as: UTF8.self))
 
 原来的“单 URL 轮询并缓存”仍然保留；新的 **AI 路由** 面向“很多免费 AI API / 订阅，自动挑最快可用”的场景。
 
+### 6.0 先说别人是怎么做的（GitHub 调研）
+
+同类项目的主流做法（`tbphp/gpt-load` 约 7k★、`songquanpeng/one-api` 约 37k★，以及一堆“免费 API 池”项目）本质是同一个套路：
+
+| 别人做的事 | 为什么快 / 为什么能用 |
+|---|---|
+| 统一入口：只暴露一个 OpenAI 兼容的 `/v1` | 客户端只要填一个 Base URL + 任意 Key，不用改代码 |
+| 端点池：把很多免费 API / 多把 Key 放进同一个池子 | 单个站点限流或挂了不影响整体 |
+| 健康检查 + 冷却（circuit breaker） | 坏端点很快被踢出，不会每次都撞墙 |
+| 失败重试 / 换 Key | 429、5xx 自动换下一个，用户无感 |
+| **流式透传（SSE）** | 这是“感觉快”的关键：第一个 token 一出来就推给客户端，而不是等整段生成完 |
+| 模型映射 | 客户端统一填一个模型名，网关按端点替换成上游真实的模型名 |
+
+这个 App（iPhone 版）现在按同样的思路做了：
+
+- **统一入口**：`http://<iPhone IP>:8787/v1`，模型只有一个 `auto`；
+- **端点池**：粘贴 API + Key → 获取模型 → 一键全选，或订阅批量导入，多把 Key 也可并存；
+- **健康检查 + 冷却**：每 30 秒探测，失败进冷却，恢复自动回队；
+- **流式透传**：`stream:true` 逐行转发上游 SSE，**首字节竞速**——谁先吐出第一行就锁谁，其余立刻取消；
+- **模型映射**：客户端只发 `auto`，路由器按端点把 `model` 换成上游真实模型名。
+
+和它们的区别：这是**跑在 iPhone 里的本地网关**，不需要服务器、不需要 Docker，用画中画 + 静音音频保活，同一 Wi-Fi 的电脑和手机都能连。
+
 ### 6.1 三步：粘贴 API → 获取模型 → 一键全选添加
 
 1. 「AI 路由」页 → 端点区点 **“粘贴 API + Key，一键获取模型”**（或右上角 `+` 里也有同样入口）；
@@ -291,13 +314,23 @@ AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/v1/chat/completions` | 代理到当前最优端点；统一 `stream=false`，返回完整 JSON |
+| POST | `/v1/chat/completions` | 代理到当前最优端点；`stream:true` 走 **SSE 流式透传**，`stream:false` 返回完整 JSON |
 | GET | `/v1/models` | **只返回一个模型 `auto`**，真实模型由路由在后台自动挑 |
 | GET | `/router/status` | 所有端点健康状态、延迟、排名、统计 |
 | GET | `/router/best` | 当前最优端点信息（不返回 API Key） |
 | POST | `/router/refresh` | 立即重新探测所有端点 |
 
 > 客户端里模型列表会只显示一个 **auto（自动）**；点刷新也还是这一个。这是故意的：你加了多少个模型、多少个订阅都不用改客户端，路由自己换。
+
+**在任何 OpenAI 兼容客户端里只要填三个字段（Cherry Studio / Chatbox / OpenWebUI / LobeChat / Continue / 各种"AI 聚合助手"都适用）：**
+
+| 字段 | 填什么 |
+|---|---|
+| API 地址 / Base URL | 手机上的 App 自己用：`http://127.0.0.1:8787/v1`<br>同一 Wi-Fi 的电脑/平板：`http://<iPhone 的 IP>:8787/v1`（IP 在 App 首页能看到） |
+| API Key | 随便填，例如 `sk-local`（除非你在设置里开了"访问令牌"，那就填那个令牌） |
+| 模型 | 选 `auto`（列表里只有这一个，刷新也一样） |
+
+填完直接对话即可：路由会在你添加的所有端点里自动挑当时最快、可用的那个，客户端完全不用改。
 
 示例：
 
@@ -315,7 +348,10 @@ curl "http://127.0.0.1:8787/router/best"
 
 - `model` 填 `auto` 即可；端点自己配了模型时以端点为准，端点没配则用上游默认模型；
 - 上游 Key 优先用端点里配置的；为空时把本地请求的 `Authorization` 透传给上游；
-- 目前**不支持 SSE 流式透传**，会把 `stream` 强制为 `false`，返回完整 JSON；需要流式的客户端请先关流式；
+- `stream:true` 会原样转发上游 SSE 事件（`data:` 行、空行分隔），并在上游没发 `[DONE]` 时补一条；
+- 上游如果忽略 `stream` 直接回整段 JSON，会自动包装成一条 `data: {...}` + `data: [DONE]` 的 SSE 事件，客户端不会解析失败；
+- 流式模式下“锁定端点”看的是**首字节到达时间**：谁先吐出第一行就锁谁，其余并发的上游请求立刻取消；
+- 客户端的模型名填 `auto` 即可；
 - 暂不支持 chunked 请求体；OpenAI SDK / curl 默认的 JSON 请求没问题；
 - 返回的是上游原始响应体，Content-Type 原样带回；
 - 如果所有端点都失败，返回 JSON 错误（503），并带最后一次失败信息。
@@ -499,7 +535,8 @@ python3 tools/make_icon.py
 - 这是 **HTTP** 服务，不是 HTTPS；局域网内明文传输。
 - 不支持 WebSocket、HTTP/2、chunked 请求体、长连接复用。
 - 只保留最近 100 条记录；每条响应体最多保存 6000 字符（最新完整响应保存在内存中，并最多缓存 2 MB 到磁盘）。
-- AI 代理暂不支持 SSE 流式透传，会强制 `stream=false` 并返回完整 JSON；也不支持 chunked 请求体。
+- 流式是 SSE（`text/event-stream`）透传，不支持 WebSocket；请求体必须是带 `Content-Length` 的 JSON，不接受 chunked 请求体。
+- 流式请求的上游会话资源超时 900 秒，超过会被中断（一般回答不会这么久）。
 - 多端点竞速默认会同时请求最多 3 个端点；如果不希望重复请求，把“最多并发端点”改成 1。
 - 累计轮询次数会持久化保存，历史列表只展示最近 100 条。
 - 上游响应完全原样缓存；如果上游是二进制，`/latest` 会原样返回，但历史记录里只显示大小。
@@ -522,7 +559,7 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
-当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `36ce383`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒并发兜底、探测状态机加固、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有新界面字符串（例如“一键全选并添加全部”），并已通过 Release 下载校验。
+当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `b46b8402`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒首字节竞速、**SSE 流式透传**、探测状态机加固、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有流式实现的字符串（`text/event-stream`、`Transfer-Encoding: chunked`、`event: error`）和“一键全选并添加全部”，并已通过 Release 下载校验。
 
 ### 13.1 下载
 
@@ -545,14 +582,14 @@ https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/downloa
 SHA256：
 
 ```
-8b1065041597d3ff9eb7c222453325f1d55e60de89e12b45e00e5bfd34104311
+c9384e069570e4fa295095d4acd41839fb4ac4d17cd81e3bf1d455ad0a1e58f6
 ```
 
-文件大小：`926422` 字节（约 905 KB）。
+文件大小：`950718` 字节（约 928 KB）。
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
 >
-> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）三个旧包；只要大小不是 `926422` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
+> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）、926422（无流式版）四个旧包；只要大小不是 `950718` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
 
 ### 13.2 为什么是“未签名”IPA？
 
