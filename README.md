@@ -48,10 +48,12 @@
 | 模型与上下文 | 自动读取上游 JSON 的 `model`、`usage.total_tokens` 等字段 |
 | 屏幕常亮 | 可选，调试或需要长时间前台运行时使用 |
 | 示例接口 | Open-Meteo、Hitokoto、汇率、GitHub Zen、ipify |
-| AI 多端点 | 多个自定义 AI API，按健康状态/延迟自动排序 |
+| AI 多端点 | 多个自定义 AI API / 多把 Key，按健康状态与真实耗时自动排序 |
+| 获取模型 | 填 Base URL + Key 点一下就拉取模型列表，一键全选生成端点 |
 | 订阅导入 | 一个 URL 批量导入端点，6 小时自动刷新 |
-| 200ms 兜底 | 首选 200ms 未完成时并发启动后续端点，先成功者胜出 |
-| 本地 AI 入口 | `POST /v1/chat/completions`（OpenAI 兼容，非流式） |
+| 0.1 秒竞速 | 首选 100ms 未返回就并发下一个；非流式“先答完者胜”，流式“先出首字节者胜” |
+| 本地 AI 入口 | `POST /v1/chat/completions`（OpenAI 兼容；支持 SSE 流式与 tools/多模态透传） |
+| 单一模型入口 | `GET /v1/models` 只返回 `auto`，客户端换端点不用改配置 |
 
 ---
 
@@ -332,6 +334,8 @@ AI 路由页“订阅”区，**每行一个 URL**，保存后自动刷新；启
 
 填完直接对话即可：路由会在你添加的所有端点里自动挑当时最快、可用的那个，客户端完全不用改。
 
+> Base URL 带不带 `/v1`、或者客户端自己又补了一次 `/v1`（变成 `/v1/v1/...`）都能用——服务端做了路径归一化，不会因为“地址多写/少写一段”就 404。
+
 示例：
 
 ```bash
@@ -342,6 +346,11 @@ curl -X POST "http://127.0.0.1:8787/v1/chat/completions" \
 curl "http://127.0.0.1:8787/v1/models"
 curl "http://127.0.0.1:8787/router/status"
 curl "http://127.0.0.1:8787/router/best"
+
+# 验证流式：应当一段一段地出现 data: {...}，而不是等很久一次性出现
+curl -N -X POST "http://127.0.0.1:8787/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 说明：
@@ -559,7 +568,7 @@ python3 tools/make_icon.py
 3. 把 `LocalAPIBridge.app` 打成 `Payload/` 结构的 `LocalAPIBridge-unsigned.ipa`；
 4. 上传 workflow artifact，并发布到 Release `v1.0.0`。
 
-当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `b46b8402`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒首字节竞速、**SSE 流式透传**、探测状态机加固、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有流式实现的字符串（`text/event-stream`、`Transfer-Encoding: chunked`、`event: error`）和“一键全选并添加全部”，并已通过 Release 下载校验。
+当前这一版构建已在 GitHub Actions 的 macOS runner 上成功完成（对应提交 `1a40044`，包含“粘贴 API + Key → 获取模型 → 一键全选添加”、`/v1/models` 只暴露单个 `auto`、0.1 秒首字节竞速、**SSE 流式透传**、探测状态机加固、CORS 预检修复、8 MB 请求体上限）。产出的 IPA 内含 arm64 Mach-O（2.2 MB 可执行文件）、`UIBackgroundModes=audio`、`NSLocalNetworkUsageDescription`、`NSBonjourServices`、Bundle ID `com.yoyo520956.localapibridge`、最低 iOS 16.0，已校验二进制里确实带有流式实现的字符串（`text/event-stream`、`Transfer-Encoding: chunked`、`event: error`）和“一键全选并添加全部”，并已通过 Release 下载校验。
 
 ### 13.1 下载
 
@@ -582,14 +591,14 @@ https://ghfast.top/https://github.com/yoyo520956/LocalAPIBridge/releases/downloa
 SHA256：
 
 ```
-c9384e069570e4fa295095d4acd41839fb4ac4d17cd81e3bf1d455ad0a1e58f6
+c955451f57211f6dec68b149a7f46927ce99ab5144e8b0d7ef1490205fedb8e6
 ```
 
-文件大小：`950718` 字节（约 928 KB）。
+文件大小：`953584` 字节（约 931 KB）。
 
 > 加速站点是第三方公益服务，可能限速或失效；失效时换一个前缀，或直接走 Release 页面的 “Download” 按钮。也可以把仓库导入自己的 Gitee/私有镜像后用镜像下载。
 >
-> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）、926422（无流式版）四个旧包；只要大小不是 `950718` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
+> **注意缓存**：Release 资产文件名固定为 `LocalAPIBridge-unsigned.ipa`，覆盖上传后部分加速节点仍会返回旧包。下载后请务必核对上面的大小和 SHA256。历史上出现过 696944（无 AI 路由）、886022（0.2 秒版）、924267（0.1 秒初版）、926422、950718、950992、951795 等几个中间版本；只要大小不是 `953584` 就不是这一版。拿到旧包时在加速链接末尾加查询参数强制回源，例如 `...LocalAPIBridge-unsigned.ipa?v=20261119`，或换一个加速前缀。
 
 ### 13.2 为什么是“未签名”IPA？
 
