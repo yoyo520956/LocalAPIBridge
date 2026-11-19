@@ -18,7 +18,7 @@ struct APIHelpView: View {
                 endpoint("GET /json", "带元信息的 JSON 包装，上游内容放在 body 字段")
                 endpoint("GET /history?limit=20", "最近轮询记录，limit 最大 200")
                 endpoint("POST /refresh", "立即触发一次单接口轮询，返回 202")
-                endpoint("POST /v1/chat/completions", "AI 路由代理，选择当前最优端点并返回完整 JSON（不支持流式）")
+                endpoint("POST /v1/chat/completions", "AI 路由代理；stream:true 走 SSE 流式，stream:false 返回完整 JSON")
                 endpoint("GET /v1/models", "只返回一个 auto 模型，真实端路由后台自动选")
                 endpoint("GET /router/status", "所有 AI 端点的健康、延迟、排名和统计")
                 endpoint("GET /router/best", "当前最优 AI 端点（不含 API Key）")
