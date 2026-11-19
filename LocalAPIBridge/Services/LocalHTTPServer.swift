@@ -228,7 +228,8 @@ final class LocalHTTPServer {
         connection.start(queue: queue)
         // 兜底看门狗：客户端连上却迟迟不发完整请求时释放连接。
         // 对正常请求，send 完成后的 cancel 会先一步生效。
-        queue.asyncAfter(deadline: .now() + 60) {
+        // 流式回答可能持续几分钟，看门狗放到 15 分钟；正常请求发送完会先 cancel。
+        queue.asyncAfter(deadline: .now() + 900) {
             connection.cancel()
         }
         receive(on: connection, buffer: Data())
@@ -389,6 +390,10 @@ final class LocalHTTPServer {
             send(.json(status: 503, payload: ["ok": false, "error": "AI 路由尚未启动"]), on: connection)
             return
         }
+        if Self.wantsStreaming(bodyData) {
+            handleStreamingChat(router: router, bodyData: bodyData, headers: headers, on: connection)
+            return
+        }
         Task { @MainActor in
             let reply = await router.proxyChat(body: bodyData, incomingHeaders: headers)
             let httpReply = HTTPReply.data(
@@ -399,6 +404,134 @@ final class LocalHTTPServer {
             )
             self.send(httpReply, on: connection)
         }
+    }
+
+    private static func wantsStreaming(_ body: Data) -> Bool {
+        guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else {
+            return false
+        }
+        if let value = object["stream"] as? Bool {
+            return value
+        }
+        if let value = object["stream"] as? String {
+            return value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
+        }
+        return false
+    }
+
+    private func handleStreamingChat(
+        router: EndpointRouter,
+        bodyData: Data,
+        headers: [String: String],
+        on connection: NWConnection
+    ) {
+        Task { @MainActor in
+            let state = StreamSendState()
+            let stream = router.streamChat(body: bodyData, incomingHeaders: headers)
+            for await event in stream {
+                switch event {
+                case .head(let contentType):
+                    if !state.headSent {
+                        state.headSent = true
+                        self.sendStreamHead(contentType: contentType, on: connection)
+                    }
+                case .chunk(let data):
+                    if !state.headSent {
+                        state.headSent = true
+                        self.sendStreamHead(contentType: "text/event-stream; charset=utf-8", on: connection)
+                    }
+                    self.sendStreamChunk(data, on: connection)
+                case .finished:
+                    if state.headSent {
+                        self.finishStream(on: connection)
+                    } else {
+                        self.send(
+                            .json(status: 502, payload: ["ok": false, "error": "上游没有返回数据"]),
+                            on: connection
+                        )
+                    }
+                case .failed(let message, let status):
+                    if state.headSent {
+                        self.sendStreamError(message, on: connection)
+                        self.finishStream(on: connection)
+                    } else {
+                        self.send(
+                            .json(status: status > 0 ? status : 502, payload: ["ok": false, "error": message]),
+                            on: connection
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private final class StreamSendState {
+        var headSent = false
+    }
+
+    private func sendStreamHead(contentType: String, on connection: NWConnection) {
+        var head = "HTTP/1.1 200 OK\r\n"
+        head += "Content-Type: \(contentType)\r\n"
+        head += "Cache-Control: no-cache, no-transform\r\n"
+        head += "Connection: close\r\n"
+        head += "Transfer-Encoding: chunked\r\n"
+        head += "X-Accel-Buffering: no\r\n"
+        head += "Access-Control-Allow-Origin: *\r\n"
+        head += "Access-Control-Allow-Headers: *\r\n"
+        head += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        head += "Access-Control-Expose-Headers: *\r\n"
+        head += "\r\n"
+        connection.send(
+            content: Data(head.utf8),
+            contentContext: .defaultMessage,
+            isComplete: false,
+            completion: .contentProcessed { _ in }
+        )
+    }
+
+    private func sendStreamChunk(_ data: Data, on connection: NWConnection) {
+        guard !data.isEmpty else { return }
+        var frame = Data(String(data.count, radix: 16).utf8)
+        frame.append(Data("\r\n".utf8))
+        frame.append(data)
+        frame.append(Data("\r\n".utf8))
+        connection.send(
+            content: frame,
+            contentContext: .defaultMessage,
+            isComplete: false,
+            completion: .contentProcessed { _ in }
+        )
+    }
+
+    private func sendStreamError(_ message: String, on connection: NWConnection) {
+        let payload: [String: Any] = ["error": ["message": message, "type": "router_error"]]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes]),
+              let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+        sendStreamChunk(Data("event: error\ndata: \(text)\n\n".utf8), on: connection)
+    }
+
+    private func finishStream(on connection: NWConnection) {
+        connection.send(
+            content: Data("0\r\n\r\n".utf8),
+            contentContext: .defaultMessage,
+            isComplete: false,
+            completion: .contentProcessed { error in
+                guard error == nil else {
+                    connection.cancel()
+                    return
+                }
+                connection.send(
+                    content: nil,
+                    contentContext: .finalMessage,
+                    isComplete: true,
+                    completion: .contentProcessed { _ in
+                        connection.cancel()
+                    }
+                )
+            }
+        )
     }
 
     private func handleRouterQuery(kind: RouterQueryKind, on connection: NWConnection) {
