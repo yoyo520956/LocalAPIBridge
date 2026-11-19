@@ -348,6 +348,10 @@ final class LocalHTTPServer {
             path = "/"
         }
 
+        // 不同客户端粘贴 Base URL 的方式差别很大：有的带 /v1，有的不带，
+        // 有的自己又补一次 /v1。这里统一归一化，免得用户"填了地址却用不了"。
+        path = Self.normalizedAPIPath(path)
+
         if method == "POST", path == "/v1/chat/completions" {
             handleChatProxy(bodyData: bodyData, headers: headers, on: connection)
             return
@@ -682,6 +686,22 @@ final class LocalHTTPServer {
             "GET /router/best",
             "POST /router/refresh"
         ]
+    }
+
+    /// 把 `/v1/v1/...`、`/models`、`/chat/completions` 统一成标准路径。
+    private static func normalizedAPIPath(_ raw: String) -> String {
+        var value = raw
+        while value.hasPrefix("/v1/v1/") {
+            value = String(value.dropFirst(3))
+        }
+        let lower = value.lowercased()
+        if lower == "/models" {
+            return "/v1/models"
+        }
+        if lower == "/chat/completions" {
+            return "/v1/chat/completions"
+        }
+        return value
     }
 
     private func parseTarget(_ target: String) -> (path: String, query: [String: String]) {
