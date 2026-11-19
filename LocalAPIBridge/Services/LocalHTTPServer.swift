@@ -228,9 +228,10 @@ final class LocalHTTPServer {
         connection.start(queue: queue)
         // 兜底看门狗：客户端连上却迟迟不发完整请求时释放连接。
         // 对正常请求，send 完成后的 cancel 会先一步生效。
-        // 流式回答可能持续几分钟，看门狗放到 15 分钟；正常请求发送完会先 cancel。
-        queue.asyncAfter(deadline: .now() + 900) {
-            connection.cancel()
+        // 只兜底“连上但一直不发完整请求”的客户端：用 weak 捕获，
+        // 正常结束的连接可以立刻释放，不会被这个定时闭包强留。
+        queue.asyncAfter(deadline: .now() + 3_600) { [weak connection] in
+            connection?.cancel()
         }
         receive(on: connection, buffer: Data())
     }
@@ -334,7 +335,7 @@ final class LocalHTTPServer {
         }
 
         // 异步路由（AI 代理 / 路由状态）需要先做与同步路由相同的鉴权。
-        if let failure = authorizationFailure(headers: headers, target: target) {
+        if method != "OPTIONS", let failure = authorizationFailure(headers: headers, target: target) {
             send(failure, on: connection)
             return
         }
@@ -429,11 +430,20 @@ final class LocalHTTPServer {
         headers: [String: String],
         on connection: NWConnection
     ) {
+        let state = StreamSendState()
+        // 客户端关掉页面/退出 App 时 TCP 会 FIN：这里专门收一个字节来判断对端是否已走，
+        // 走了就立刻停掉上游，别继续烧额度。
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, isComplete, _ in
+            if isComplete {
+                state.clientGone = true
+                connection.cancel()
+            }
+        }
+
         Task { @MainActor in
-            let state = StreamSendState()
             let stream = router.streamChat(body: bodyData, incomingHeaders: headers)
             for await event in stream {
-                // 客户端断开（关客户端 / 退出 App）时立即停止拉上游，别白烧额度。
+                if state.clientGone { break }
                 if case .cancelled = connection.state { break }
                 if case .failed = connection.state { break }
                 switch event {
@@ -447,7 +457,7 @@ final class LocalHTTPServer {
                         state.headSent = true
                         self.sendStreamHead(contentType: "text/event-stream; charset=utf-8", on: connection)
                     }
-                    self.sendStreamChunk(data, on: connection)
+                    self.sendStreamChunk(data, on: connection, state: state)
                 case .finished:
                     if state.headSent {
                         self.finishStream(on: connection)
@@ -459,7 +469,7 @@ final class LocalHTTPServer {
                     }
                 case .failed(let message, let status):
                     if state.headSent {
-                        self.sendStreamError(message, on: connection)
+                        self.sendStreamError(message, on: connection, state: state)
                         self.finishStream(on: connection)
                     } else {
                         self.send(
@@ -474,6 +484,7 @@ final class LocalHTTPServer {
 
     private final class StreamSendState {
         var headSent = false
+        var clientGone = false
     }
 
     private func sendStreamHead(contentType: String, on connection: NWConnection) {
@@ -496,7 +507,7 @@ final class LocalHTTPServer {
         )
     }
 
-    private func sendStreamChunk(_ data: Data, on connection: NWConnection) {
+    private func sendStreamChunk(_ data: Data, on connection: NWConnection, state: StreamSendState) {
         guard !data.isEmpty else { return }
         var frame = Data(String(data.count, radix: 16).utf8)
         frame.append(Data("\r\n".utf8))
@@ -506,17 +517,21 @@ final class LocalHTTPServer {
             content: frame,
             contentContext: .defaultMessage,
             isComplete: false,
-            completion: .contentProcessed { _ in }
+            completion: .contentProcessed { error in
+                if error != nil {
+                    state.clientGone = true
+                }
+            }
         )
     }
 
-    private func sendStreamError(_ message: String, on connection: NWConnection) {
+    private func sendStreamError(_ message: String, on connection: NWConnection, state: StreamSendState) {
         let payload: [String: Any] = ["error": ["message": message, "type": "router_error"]]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes]),
               let text = String(data: data, encoding: .utf8) else {
             return
         }
-        sendStreamChunk(Data("event: error\ndata: \(text)\n\n".utf8), on: connection)
+        sendStreamChunk(Data("event: error\ndata: \(text)\n\n".utf8), on: connection, state: state)
     }
 
     private func finishStream(on connection: NWConnection) {
@@ -690,15 +705,14 @@ final class LocalHTTPServer {
 
     /// 把 `/v1/v1/...`、`/models`、`/chat/completions` 统一成标准路径。
     private static func normalizedAPIPath(_ raw: String) -> String {
-        var value = raw
+        var value = raw.lowercased()
         while value.hasPrefix("/v1/v1/") {
             value = String(value.dropFirst(3))
         }
-        let lower = value.lowercased()
-        if lower == "/models" {
+        if value == "/models" {
             return "/v1/models"
         }
-        if lower == "/chat/completions" {
+        if value == "/chat/completions" {
             return "/v1/chat/completions"
         }
         return value
