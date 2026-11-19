@@ -429,6 +429,9 @@ final class LocalHTTPServer {
             let state = StreamSendState()
             let stream = router.streamChat(body: bodyData, incomingHeaders: headers)
             for await event in stream {
+                // 客户端断开（关客户端 / 退出 App）时立即停止拉上游，别白烧额度。
+                if case .cancelled = connection.state { break }
+                if case .failed = connection.state { break }
                 switch event {
                 case .head(let contentType):
                     if !state.headSent {
